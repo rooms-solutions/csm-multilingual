@@ -6,13 +6,16 @@ import torch
 import csv
 from tqdm import tqdm
 import shutil
+from language_utils import LanguageProcessor
 
 def prepare_commonvoice(args):
     """
     Process Mozilla Common Voice dataset for training.
     Assumes you've already downloaded the dataset from https://commonvoice.mozilla.org/
     """
-    print(f"Processing Common Voice dataset from {args.input_dir}")
+    # Get language processor for the specified language
+    language_processor = LanguageProcessor.get_processor(args.language)
+    print(f"Processing Common Voice dataset ({language_processor.language_name}) from {args.input_dir}")
     
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
@@ -30,13 +33,18 @@ def prepare_commonvoice(args):
     if args.min_duration:
         df = df[df['duration'] >= args.min_duration]
     
+    # Get column indices for this language
+    col_indices = language_processor.get_commonvoice_column_indices()
+    path_col = col_indices["path"]
+    text_col = col_indices["text"]
+    
     # Create a new dataframe for the processed data
     processed_data = []
     
     # Process each clip
     print(f"Processing {len(df)} clips...")
     for idx, row in tqdm(df.iterrows(), total=len(df)):
-        clip_path = os.path.join(args.input_dir, "clips", row['path'])
+        clip_path = os.path.join(args.input_dir, "clips", row.iloc[path_col])
         
         try:
             # Load and resample audio
@@ -57,16 +65,22 @@ def prepare_commonvoice(args):
                 if peak < 0.01 or peak > 0.99:
                     continue
             
+            # Get and normalize text
+            text = row.iloc[text_col]
+            normalized_text = language_processor.normalize_text(text)
+            
             # Save processed audio
-            output_path = os.path.join(args.output_dir, "clips", row['path'])
+            output_path = os.path.join(args.output_dir, "clips", row.iloc[path_col])
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, waveform, 24000)
             
             # Add to processed data
             processed_data.append({
-                'path': row['path'],
-                'sentence': row['sentence'],
-                'duration': waveform.size(1) / 24000
+                'path': row.iloc[path_col],
+                'sentence': normalized_text,
+                'original_sentence': text,
+                'duration': waveform.size(1) / 24000,
+                'language': args.language
             })
             
             if len(processed_data) >= args.max_samples and args.max_samples > 0:
@@ -78,7 +92,7 @@ def prepare_commonvoice(args):
             continue
     
     # Create new TSV file
-    output_tsv = os.path.join(args.output_dir, "processed.tsv")
+    output_tsv = os.path.join(args.output_dir, f"processed_{args.language}.tsv")
     pd.DataFrame(processed_data).to_csv(output_tsv, sep='\t', index=False)
     
     # Create train-test split
@@ -90,14 +104,28 @@ def prepare_commonvoice(args):
         train_df = df_processed.drop(test_df.index)
         
         # Save splits
-        train_df.to_csv(os.path.join(args.output_dir, "train.tsv"), sep='\t', index=False)
-        test_df.to_csv(os.path.join(args.output_dir, "test.tsv"), sep='\t', index=False)
+        train_df.to_csv(os.path.join(args.output_dir, f"train_{args.language}.tsv"), sep='\t', index=False)
+        test_df.to_csv(os.path.join(args.output_dir, f"test_{args.language}.tsv"), sep='\t', index=False)
         
         print(f"Train set: {len(train_df)} samples")
         print(f"Test set: {len(test_df)} samples")
     
     print(f"Processed {len(processed_data)} clips successfully.")
     print(f"Output TSV file: {output_tsv}")
+    
+    # Create language metadata file
+    language_meta = {
+        "language_code": language_processor.language_code,
+        "language_name": language_processor.language_name,
+        "sample_count": len(processed_data),
+        "total_duration_seconds": sum(item["duration"] for item in processed_data)
+    }
+    
+    meta_path = os.path.join(args.output_dir, f"meta_{args.language}.json")
+    import json
+    with open(meta_path, 'w') as f:
+        json.dump(language_meta, f, indent=2)
+    print(f"Created language metadata: {meta_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Process Mozilla Common Voice dataset for training")
@@ -105,6 +133,8 @@ def main():
                         help="Input directory containing Common Voice dataset")
     parser.add_argument("--output_dir", type=str, required=True, 
                         help="Output directory for processed data")
+    parser.add_argument("--language", type=str, required=True,
+                        help="Language code (e.g., 'de' for German, 'en' for English)")
     parser.add_argument("--max_duration", type=float, default=10.0, 
                         help="Maximum audio duration in seconds")
     parser.add_argument("--min_duration", type=float, default=1.0, 

@@ -1,0 +1,30 @@
+{
+  "language_code": "de",
+  "language_name": "German",
+  "commonvoice_version": "15.0",
+  "text_preprocessing": {
+    "normalize_numbers": true,
+    "expand_abbreviations": true,
+    "normalize_punctuation": true
+  },
+  "training_params": {
+    "learning_rate": 4e-5,
+    "batch_size": 4,
+    "epochs": 10,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0
+  },
+  "pronunciation_guide": {
+    "ß": "ss",
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue"
+  },
+  "common_expansions": {
+    "z.B.": "zum Beispiel",
+    "usw.": "und so weiter",
+    "etc.": "et cetera",
+    "Dr.": "Doktor",
+    "Prof.": "Professor"
+  }
+}
