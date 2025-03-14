@@ -61,8 +61,23 @@ class MultilingualVoiceDataset(Dataset):
         text = self.voice_frame.iloc[idx]['sentence']
         processed_text = self.language_processor.preprocess_text(text)
         
-        # Format with speaker ID
-        speaker_id = self.voice_frame.iloc[idx].get('speaker_id', self.language_processor.default_speaker_id)
+        # Format with speaker ID - try to use client_id if available, fallback to gender, otherwise use default
+        if 'client_id' in self.voice_frame.columns and not pd.isna(self.voice_frame.iloc[idx]['client_id']):
+            # Hash the client_id to an integer to use as speaker ID
+            client_id = self.voice_frame.iloc[idx]['client_id']
+            speaker_id = hash(client_id) % 100  # Limit to 100 different speaker IDs
+        elif 'gender' in self.voice_frame.columns and not pd.isna(self.voice_frame.iloc[idx]['gender']):
+            # Map gender to speaker IDs: female=1, male=2, other=3
+            gender = self.voice_frame.iloc[idx]['gender'].lower()
+            if gender == 'female':
+                speaker_id = 1
+            elif gender == 'male':
+                speaker_id = 2
+            else:
+                speaker_id = 3
+        else:
+            speaker_id = self.language_processor.default_speaker_id
+            
         formatted_text = self.language_processor.format_speaker_text(processed_text, speaker_id)
         
         # Tokenize text

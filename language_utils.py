@@ -30,11 +30,16 @@ class LanguageProcessor:
             speaker_id = self.default_speaker_id
         return f"[{speaker_id}]{text}"
     
-    def get_commonvoice_column_indices(self) -> Dict[str, int]:
-        """Return column indices for CommonVoice dataset"""
+    def get_commonvoice_column_indices(self) -> Dict[str, str]:
+        """Return column names for CommonVoice dataset"""
         return {
-            "path": 1,  # Default column index for path in CommonVoice TSV
-            "text": 2,  # Default column index for text in CommonVoice TSV
+            "path": "path",           # Path column name
+            "text": "sentence",       # Text/sentence column name
+            "gender": "gender",       # Gender column name
+            "client_id": "client_id", # Client ID column name
+            "accent": "accents",      # Accent column name
+            "locale": "locale",       # Locale column name
+            "segment": "segment"      # Segment column name
         }
     
     @staticmethod

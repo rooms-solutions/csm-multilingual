@@ -33,10 +33,8 @@ def prepare_commonvoice(args):
     if args.min_duration:
         df = df[df['duration'] >= args.min_duration]
     
-    # Get column indices for this language
-    col_indices = language_processor.get_commonvoice_column_indices()
-    path_col = col_indices["path"]
-    text_col = col_indices["text"]
+    # Get column names for this language
+    col_names = language_processor.get_commonvoice_column_indices()
     
     # Create a new dataframe for the processed data
     processed_data = []
@@ -44,7 +42,7 @@ def prepare_commonvoice(args):
     # Process each clip
     print(f"Processing {len(df)} clips...")
     for idx, row in tqdm(df.iterrows(), total=len(df)):
-        clip_path = os.path.join(args.input_dir, "clips", row.iloc[path_col])
+        clip_path = os.path.join(args.input_dir, "clips", row[col_names["path"]])
         
         try:
             # Load and resample audio
@@ -66,21 +64,25 @@ def prepare_commonvoice(args):
                     continue
             
             # Get and normalize text
-            text = row.iloc[text_col]
+            text = row[col_names["text"]]
             normalized_text = language_processor.normalize_text(text)
             
             # Save processed audio
-            output_path = os.path.join(args.output_dir, "clips", row.iloc[path_col])
+            output_path = os.path.join(args.output_dir, "clips", row[col_names["path"]])
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, waveform, 24000)
             
             # Add to processed data
             processed_data.append({
-                'path': row.iloc[path_col],
+                'path': row[col_names["path"]],
                 'sentence': normalized_text,
                 'original_sentence': text,
                 'duration': waveform.size(1) / 24000,
-                'language': args.language
+                'language': args.language,
+                'gender': row.get(col_names["gender"], ''),
+                'client_id': row.get(col_names["client_id"], ''),
+                'accent': row.get(col_names["accent"], ''),
+                'locale': row.get(col_names["locale"], args.language)
             })
             
             if len(processed_data) >= args.max_samples and args.max_samples > 0:
