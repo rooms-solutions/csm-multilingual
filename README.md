@@ -36,8 +36,8 @@ Our multilingual extension adds:
 
 ```bash
 # Clone this repository
-git clone https://github.com/yourusername/multilingual-tts.git
-cd multilingual-tts
+git clone https://github.com/rooms-solutions/csm-multilingual
+cd csm-multilingual
 
 # Install dependencies
 pip install -r requirements.txt
