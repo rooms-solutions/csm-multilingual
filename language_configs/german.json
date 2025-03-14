@@ -1,7 +1,7 @@
 {
   "language_code": "de",
   "language_name": "German",
-  "commonvoice_version": "15.0",
+  "commonvoice_version": "20.0",
   "text_preprocessing": {
     "normalize_numbers": true,
     "expand_abbreviations": true,

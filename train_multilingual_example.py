@@ -85,7 +85,7 @@ def train_language(args, language):
     
     # Run the training script
     cmd = [
-        "python", "train_german.py",  # Use the refactored script (still named train_german.py)
+        "python", "train_multilingual.py",
         "--language", language,
         "--train_csv", train_csv,
         "--data_dir", args.output_dir,
