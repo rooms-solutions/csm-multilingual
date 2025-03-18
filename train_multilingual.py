@@ -34,6 +34,9 @@ logger = logging.getLogger("train_multilingual")
 
 def process_batch(model, text_tokens, audio_tokens, device):
     """Process a single batch and calculate the loss"""
+    # Debug print to verify input shapes
+    print(f"Debug - text_tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
+    
     # Create input format
     b, s = text_tokens.size()
     text_frame = torch.zeros(b, s, 33).long().to(device)
@@ -65,7 +68,14 @@ def process_batch(model, text_tokens, audio_tokens, device):
     
     # First codebook prediction using the backbone output
     c0_logits = model.codebook0_head(last_h.squeeze(1))
-    c0_targets = audio_tokens[:, 0]
+    # Extract target as 1D tensor - cross_entropy expects class indices, not multi-dimensional targets
+    if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
+        c0_targets = audio_tokens[:, 0, 0]  # Get first token of first codebook for each batch item
+    else:  # If shape is [batch_size, num_codebooks]
+        c0_targets = audio_tokens[:, 0]  # Get first codebook for each batch item
+    
+    # Make sure targets are 1D
+    c0_targets = c0_targets.view(-1)
     c0_loss = nn.functional.cross_entropy(c0_logits, c0_targets)
     total_loss += c0_loss
     
@@ -84,7 +94,15 @@ def process_batch(model, text_tokens, audio_tokens, device):
         
         # Get logits and targets
         ci_logits = torch.matmul(decoder_h[:, -1, :].unsqueeze(1), model.audio_head[i-1]).squeeze(1)
-        ci_targets = audio_tokens[:, i]
+        
+        # Extract target as 1D tensor
+        if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
+            ci_targets = audio_tokens[:, i, 0]  # Get first token of ith codebook for each batch item
+        else:  # If shape is [batch_size, num_codebooks]
+            ci_targets = audio_tokens[:, i]  # Get ith codebook for each batch item
+            
+        # Make sure targets are 1D
+        ci_targets = ci_targets.view(-1)
         
         # Calculate loss
         ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
