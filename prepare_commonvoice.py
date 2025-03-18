@@ -1,6 +1,21 @@
 import argparse
 import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("commonvoice_prepare.log")
+    ]
+)
+logger = logging.getLogger("prepare_commonvoice")
 
 # Try importing pandas with error handling
 try:
@@ -26,6 +41,74 @@ import csv
 from tqdm import tqdm
 import shutil
 from language_utils import LanguageProcessor
+
+def process_audio_file(params):
+    """
+    Process a single audio file
+    
+    Args:
+        params: Dictionary containing parameters needed for processing
+        
+    Returns:
+        Dictionary with processed data or None if processing failed
+    """
+    try:
+        row, args, col_names, language_processor, input_dir, output_dir = params
+        
+        clip_path = os.path.join(input_dir, "clips", row[col_names["path"]])
+        
+        # Load and resample audio
+        waveform, sample_rate = torchaudio.load(clip_path)
+        
+        # Convert to mono
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        
+        # Resample to 24kHz
+        if sample_rate != 24000:
+            waveform = torchaudio.functional.resample(waveform, orig_freq=sample_rate, new_freq=24000)
+        
+        # Check audio quality if needed
+        if args.filter_quality:
+            # Simple quality check: ensure audio is not too quiet or too loud
+            peak = waveform.abs().max().item()
+            if peak < 0.01 or peak > 0.99:
+                return None
+        
+        # Get and normalize text
+        text = row[col_names["text"]]
+        normalized_text = language_processor.normalize_text(text)
+        
+        # Save processed audio
+        output_path = os.path.join(output_dir, "clips", row[col_names["path"]])
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        torchaudio.save(output_path, waveform, 24000)
+        
+        # Calculate duration from waveform
+        duration_seconds = waveform.size(1) / 24000
+        
+        # Apply duration filtering here
+        if args.max_duration and duration_seconds > args.max_duration:
+            return None
+        if args.min_duration and duration_seconds < args.min_duration:
+            return None
+            
+        # Return processed data
+        return {
+            'path': row[col_names["path"]],
+            'sentence': normalized_text,
+            'original_sentence': text,
+            'duration': duration_seconds,
+            'language': args.language,
+            'gender': row.get(col_names["gender"], ''),
+            'client_id': row.get(col_names["client_id"], ''),
+            'accent': row.get(col_names["accent"], ''),
+            'locale': row.get(col_names["locale"], args.language)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing {row[col_names['path']]}: {e}")
+        return None
 
 def prepare_commonvoice(args):
     """
@@ -55,72 +138,54 @@ def prepare_commonvoice(args):
     # Create a new dataframe for the processed data
     processed_data = []
     
-    # Process each clip
-    print(f"Processing {len(df)} clips...")
-    for idx, row in tqdm(df.iterrows(), total=len(df)):
-        clip_path = os.path.join(args.input_dir, "clips", row[col_names["path"]])
+    # Set up parallel processing
+    num_workers = args.num_workers if args.num_workers > 0 else max(1, multiprocessing.cpu_count() - 1)
+    logger.info(f"Processing {len(df)} clips using {num_workers} workers...")
+    
+    start_time = time.time()
+    processed_count = 0
+    processed_data = []
+    
+    # Prepare parameters for parallel processing
+    process_params = []
+    for _, row in df.iterrows():
+        process_params.append((row, args, col_names, language_processor, args.input_dir, args.output_dir))
         
-        try:
-            # Load and resample audio
-            waveform, sample_rate = torchaudio.load(clip_path)
-            
-            # Convert to mono
-            if waveform.size(0) > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            
-            # Resample to 24kHz
-            if sample_rate != 24000:
-                waveform = torchaudio.functional.resample(waveform, orig_freq=sample_rate, new_freq=24000)
-            
-            # Check audio quality if needed
-            if args.filter_quality:
-                # Simple quality check: ensure audio is not too quiet or too loud
-                peak = waveform.abs().max().item()
-                if peak < 0.01 or peak > 0.99:
-                    continue
-            
-            # Get and normalize text
-            text = row[col_names["text"]]
-            normalized_text = language_processor.normalize_text(text)
-            
-            # Save processed audio
-            output_path = os.path.join(args.output_dir, "clips", row[col_names["path"]])
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, waveform, 24000)
-            
-            # Calculate duration from waveform
-            duration_seconds = waveform.size(1) / 24000
-            
-            # Apply duration filtering here
-            if args.max_duration and duration_seconds > args.max_duration:
-                continue
-            if args.min_duration and duration_seconds < args.min_duration:
-                continue
+        # Limit the number of samples if specified
+        if args.max_samples > 0 and len(process_params) >= args.max_samples:
+            logger.info(f"Limiting to {args.max_samples} samples as requested")
+            break
+    
+    # Create a progress bar
+    progress_bar = tqdm(total=len(process_params), desc="Processing audio files")
+    
+    # Process files in parallel
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_params = {executor.submit(process_audio_file, param): param for param in process_params}
+        
+        # Process results as they complete
+        for future in future_to_params:
+            result = future.result()
+            if result is not None:
+                processed_data.append(result)
+                processed_count += 1
                 
-            # Add to processed data
-            processed_data.append({
-                'path': row[col_names["path"]],
-                'sentence': normalized_text,
-                'original_sentence': text,
-                'duration': duration_seconds,
-                'language': args.language,
-                'gender': row.get(col_names["gender"], ''),
-                'client_id': row.get(col_names["client_id"], ''),
-                'accent': row.get(col_names["accent"], ''),
-                'locale': row.get(col_names["locale"], args.language)
-            })
+                # Log progress periodically
+                if processed_count % 100 == 0:
+                    elapsed = time.time() - start_time
+                    rate = processed_count / elapsed if elapsed > 0 else 0
+                    logger.info(f"Processed {processed_count}/{len(process_params)} files ({rate:.2f} files/sec)")
             
-            if len(processed_data) >= args.max_samples and args.max_samples > 0:
-                print(f"Reached maximum sample count: {args.max_samples}")
-                break
-                
-            # Print progress occasionally
-            if len(processed_data) % 100 == 0:
-                print(f"Processed {len(processed_data)} clips so far")
-                
-        except Exception as e:
-            print(f"Error processing {clip_path}: {e}")
-            continue
+            # Update progress bar
+            progress_bar.update(1)
+    
+    progress_bar.close()
+    
+    # Log final stats
+    total_time = time.time() - start_time
+    logger.info(f"Finished processing {processed_count} files in {total_time:.2f} seconds")
+    logger.info(f"Success rate: {len(processed_data)}/{processed_count} ({len(processed_data)/processed_count*100:.2f}%)")
     
     # Create new TSV file
     output_tsv = os.path.join(args.output_dir, f"processed_{args.language}.tsv")
@@ -176,6 +241,8 @@ def main():
                         help="Fraction of data to use for testing")
     parser.add_argument("--max_samples", type=int, default=-1, 
                         help="Maximum number of samples to process (-1 for all)")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Number of worker processes (default: auto-detect)")
     
     args = parser.parse_args()
     prepare_commonvoice(args)
