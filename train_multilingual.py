@@ -245,11 +245,11 @@ def train(args):
             
             # Note: audio_waveform is now a list (not tensor) and not needed for training
             
+            # Setup model caches (must be done before reset)
+            model.setup_caches(text_tokens.size(0))
+            
             # Reset caches
             model.reset_caches()
-            
-            # Setup model caches
-            model.setup_caches(text_tokens.size(0))
             
             # Forward pass and loss calculation
             if args.use_amp:
