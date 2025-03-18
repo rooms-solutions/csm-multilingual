@@ -34,8 +34,9 @@ logger = logging.getLogger("train_multilingual")
 
 def process_batch(model, text_tokens, audio_tokens, device):
     """Process a single batch and calculate the loss"""
-    # Debug print to verify input shapes
+    # Debug prints to verify input shapes and types
     print(f"Debug - text_tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
+    print(f"Debug - model dtype: {next(model.parameters()).dtype}")
     
     # Create input format
     b, s = text_tokens.size()
@@ -80,8 +81,15 @@ def process_batch(model, text_tokens, audio_tokens, device):
     total_loss += c0_loss
     
     # Teacher forcing for remaining codebooks
-    curr_h = model._embed_audio(0, audio_tokens[:, 0:1])
-    curr_h = torch.cat([last_h, curr_h], dim=1)
+    # Debug print to understand shapes
+    audio_embed = model._embed_audio(0, audio_tokens[:, 0, 0].view(-1, 1))
+    
+    # Fix dimensions - ensure audio_embed matches last_h dimensions (batch_size, seq_len, hidden_dim)
+    if audio_embed.dim() == 4:  # If shape is [B, 1, 1, H]
+        audio_embed = audio_embed.squeeze(2)  # Remove the extra dimension
+        
+    # Concatenate along sequence dimension
+    curr_h = torch.cat([last_h, audio_embed], dim=1)
     curr_pos = torch.tensor([[0, 1]], device=device).repeat(b, 1)
     
     # Process through decoder for subsequent codebooks
@@ -110,7 +118,14 @@ def process_batch(model, text_tokens, audio_tokens, device):
         
         # For next iteration, if not the last codebook
         if i < num_codebooks - 1:
-            ci_embed = model._embed_audio(i, audio_tokens[:, i:i+1])
+            # Get embedding for the next codebook token
+            ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].view(-1, 1))
+            
+            # Fix dimensions - ensure consistent shape
+            if ci_embed.dim() == 4:
+                ci_embed = ci_embed.squeeze(2)
+                
+            # Update current hidden state and position
             curr_h = ci_embed
             curr_pos = curr_pos[:, -1:] + 1
     
