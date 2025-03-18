@@ -146,11 +146,12 @@ class MultilingualVoiceDataset(Dataset):
         # Tokenize text
         text_tokens = self.text_tokenizer.encode(formatted_text)
         
-        # Keep waveform on CPU - it will be moved to the appropriate device in the forward pass
-        # This avoids CUDA issues in DataLoader worker processes
+        # Process audio through Mimi encoder
         with torch.no_grad():
-            # First use CPU tensors for the worker process
-            audio_tokens = self.mimi.encode(waveform.unsqueeze(0).unsqueeze(0).cpu())[0]
+            # Get the device of the Mimi model and ensure tensor is on the same device
+            device = next(self.mimi.parameters()).device
+            waveform_tensor = waveform.unsqueeze(0).unsqueeze(0).to(device)
+            audio_tokens = self.mimi.encode(waveform_tensor)[0]
         
         # Get the device for consistency
         device = next(self.mimi.parameters()).device
@@ -158,9 +159,9 @@ class MultilingualVoiceDataset(Dataset):
         return {
             "text": processed_text,
             "raw_text": text,
-            "text_tokens": torch.tensor(text_tokens, device="cpu"),  # Keep on CPU, will be moved to GPU in batch
-            "audio_tokens": audio_tokens,
-            "audio_waveform": waveform,
+            "text_tokens": torch.tensor(text_tokens, device="cpu"),  # Keep on CPU, moved to GPU in the training loop
+            "audio_tokens": audio_tokens.to(device),                 # Already on the right device
+            "audio_waveform": waveform.to("cpu"),                    # Keep waveform on CPU to save GPU memory
             "speaker_id": speaker_id,
             "language": self.language_processor.language_code
         }

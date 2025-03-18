@@ -100,9 +100,12 @@ def evaluate(model, val_loader, device):
     
     with torch.no_grad():
         for batch in val_loader:
-            # Prepare input tensors
+            # Prepare input tensors - ensure they're on the right device
             text_tokens = batch["text_tokens"].to(device)
-            audio_tokens = batch["audio_tokens"].to(device)
+            audio_tokens = batch["audio_tokens"]
+            # Only move to device if not already there
+            if audio_tokens.device != device:
+                audio_tokens = audio_tokens.to(device)
             
             # Reset and setup caches
             model.reset_caches()
