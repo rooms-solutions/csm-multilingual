@@ -18,7 +18,7 @@ if __name__ == "__main__":
 from generator import load_llama3_tokenizer
 from models import Model, ModelArgs, _index_causal_mask
 from moshi.models import loaders
-from multilingual_dataset import create_dataset_for_language
+from multilingual_dataset import create_dataset_for_language, multilingual_collate_fn
 from language_utils import LanguageProcessor
 
 # Configure logging
@@ -179,7 +179,8 @@ def train(args):
         shuffle=True,
         num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA to avoid forking issues
         pin_memory=True if args.device == "cuda" else False,
-        drop_last=True
+        drop_last=True,
+        collate_fn=multilingual_collate_fn  # Use our custom collate function
     )
     
     # Create validation dataloader if provided
@@ -199,6 +200,7 @@ def train(args):
             shuffle=False,
             num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA
             pin_memory=True if args.device == "cuda" else False,
+            collate_fn=multilingual_collate_fn  # Use our custom collate function
         )
     
     # Define optimizer

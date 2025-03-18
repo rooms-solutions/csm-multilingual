@@ -189,6 +189,32 @@ class GermanVoiceDataset(MultilingualVoiceDataset):
         )
         
 
+def multilingual_collate_fn(batch):
+    """
+    Custom collate function to handle variable length sequences.
+    Pads text_tokens to the same length within a batch.
+    """
+    # Find the maximum length of text_tokens in the batch
+    max_text_length = max(item["text_tokens"].size(0) for item in batch)
+    
+    # Create padded text_tokens
+    for item in batch:
+        text_tokens = item["text_tokens"]
+        padded_text_tokens = torch.zeros(max_text_length, dtype=text_tokens.dtype, device=text_tokens.device)
+        padded_text_tokens[:text_tokens.size(0)] = text_tokens
+        item["text_tokens"] = padded_text_tokens
+    
+    # Use default collate for the batch with padded tensors
+    elem = batch[0]
+    batch_dict = {
+        key: torch.stack([d[key] for d in batch]) if torch.is_tensor(elem[key]) 
+        else [d[key] for d in batch] 
+        for key in elem
+    }
+    
+    return batch_dict
+
+
 def create_dataset_for_language(
     language: str,
     csv_file: str,
