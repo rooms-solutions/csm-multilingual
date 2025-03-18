@@ -144,11 +144,20 @@ def train(args):
             logger.warning(f"Failed to load checkpoint: {e}")
             logger.info("Starting with fresh model weights")
     
+    # Determine the correct root directory - either the main data_dir or the language subdirectory
+    lang_specific_dir = os.path.join(args.data_dir, args.language)
+    if os.path.exists(os.path.join(lang_specific_dir, "clips")):
+        root_dir = lang_specific_dir
+        logger.info(f"Using language-specific directory as root: {root_dir}")
+    else:
+        root_dir = args.data_dir
+        logger.info(f"Using main data directory as root: {root_dir}")
+    
     # Create dataset for specified language
     train_dataset = create_dataset_for_language(
         language=args.language,
         csv_file=args.train_csv,
-        root_dir=args.data_dir,
+        root_dir=root_dir,
         mimi_model=mimi_model,
         text_tokenizer=text_tokenizer,
         max_audio_length=args.max_audio_length,
@@ -170,7 +179,7 @@ def train(args):
         val_dataset = create_dataset_for_language(
             language=args.language,
             csv_file=args.val_csv,
-            root_dir=args.data_dir,
+            root_dir=root_dir,
             mimi_model=mimi_model,
             text_tokenizer=text_tokenizer,
             max_audio_length=args.max_audio_length,

@@ -77,18 +77,38 @@ class MultilingualVoiceDataset(Dataset):
         
         # Try multiple possible clip paths
         possible_paths = [
-            os.path.join(self.root_dir, "clips", file_path),  # Standard path
-            os.path.join(self.root_dir, "clips", os.path.basename(file_path)),  # Just filename
+            os.path.join(self.root_dir, "clips", os.path.basename(file_path)),  # Just filename in clips folder
+            os.path.join(self.root_dir, "clips", file_path),  # Full path in clips folder
             os.path.join(self.root_dir, file_path),  # Direct path
+            file_path if os.path.isabs(file_path) else None,  # Absolute path as is
         ]
         
+        # Filter None values
+        possible_paths = [p for p in possible_paths if p]
+        
+        # Print debugging for first file to help diagnose path issues
+        if idx == 0:
+            print(f"Looking for audio file with base path: {file_path}")
+            print(f"Root dir: {self.root_dir}")
+            print(f"Trying paths: {possible_paths}")
+            
         audio_path = None
         for path in possible_paths:
             if os.path.exists(path):
                 audio_path = path
+                if idx == 0:
+                    print(f"Found audio file at: {path}")
                 break
                 
         if audio_path is None:
+            # Check if clips folder exists
+            clips_dir = os.path.join(self.root_dir, "clips")
+            if os.path.exists(clips_dir):
+                print(f"Clips directory exists at {clips_dir}")
+                print(f"Files in clips directory: {os.listdir(clips_dir)[:5]}...")
+            else:
+                print(f"Clips directory not found at {clips_dir}")
+            
             raise FileNotFoundError(f"Audio file not found: {file_path} - tried paths: {possible_paths}")
             
         waveform, sample_rate = torchaudio.load(audio_path)
