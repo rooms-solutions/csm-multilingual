@@ -62,7 +62,24 @@ class MultilingualVoiceDataset(Dataset):
         
     def __getitem__(self, idx):
         # Load audio file and resample to 24kHz
-        audio_path = os.path.join(self.root_dir, "clips", self.voice_frame.iloc[idx]['path'])
+        file_path = self.voice_frame.iloc[idx]['path']
+        
+        # Try multiple possible clip paths
+        possible_paths = [
+            os.path.join(self.root_dir, "clips", file_path),  # Standard path
+            os.path.join(self.root_dir, "clips", os.path.basename(file_path)),  # Just filename
+            os.path.join(self.root_dir, file_path),  # Direct path
+        ]
+        
+        audio_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                audio_path = path
+                break
+                
+        if audio_path is None:
+            raise FileNotFoundError(f"Audio file not found: {file_path} - tried paths: {possible_paths}")
+            
         waveform, sample_rate = torchaudio.load(audio_path)
         waveform = waveform.mean(dim=0)  # Convert to mono
         if sample_rate != 24000:

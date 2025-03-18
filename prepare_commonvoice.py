@@ -55,8 +55,23 @@ def process_audio_file(params):
     try:
         row, args, col_names, language_processor, input_dir, output_dir = params
         
-        clip_path = os.path.join(input_dir, "clips", row[col_names["path"]])
+        # Try multiple possible clip paths (Common Voice dataset structure varies by version)
+        possible_paths = [
+            os.path.join(input_dir, "clips", row[col_names["path"]]),  # Standard path
+            os.path.join(input_dir, "clips", os.path.basename(row[col_names["path"]])),  # Just filename 
+            os.path.join(input_dir, row[col_names["path"]]),  # Direct path without clips
+        ]
         
+        clip_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                clip_path = path
+                break
+                
+        if clip_path is None:
+            logger.warning(f"Audio file not found: {row[col_names['path']]} - tried paths: {possible_paths}")
+            return None
+            
         # Load and resample audio
         waveform, sample_rate = torchaudio.load(clip_path)
         
@@ -80,7 +95,7 @@ def process_audio_file(params):
         normalized_text = language_processor.normalize_text(text)
         
         # Save processed audio
-        output_path = os.path.join(output_dir, "clips", row[col_names["path"]])
+        output_path = os.path.join(output_dir, "clips", os.path.basename(row[col_names["path"]]))
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torchaudio.save(output_path, waveform, 24000)
         
