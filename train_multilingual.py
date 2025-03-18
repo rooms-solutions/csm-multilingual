@@ -5,9 +5,15 @@ import torch.nn as nn
 import torch.optim as optim
 import json
 import logging
+import multiprocessing
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
+
+# Fix CUDA multiprocessing issue by setting the start method to 'spawn'
+if __name__ == "__main__":
+    # This must happen at the beginning before any other multiprocessing code
+    multiprocessing.set_start_method('spawn', force=True)
 
 from generator import load_llama3_tokenizer
 from models import Model, ModelArgs, _index_causal_mask
@@ -163,13 +169,13 @@ def train(args):
         max_audio_length=args.max_audio_length,
     )
     
-    # Create train dataloader
+    # Create train dataloader with safer settings for CUDA
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA to avoid forking issues
+        pin_memory=True if args.device == "cuda" else False,
         drop_last=True
     )
     
@@ -188,8 +194,8 @@ def train(args):
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
+            num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA
+            pin_memory=True if args.device == "cuda" else False,
         )
     
     # Define optimizer

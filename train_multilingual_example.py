@@ -8,8 +8,14 @@ import argparse
 import subprocess
 import logging
 import sys
+import multiprocessing
 from glob import glob
 import json
+
+# Fix CUDA multiprocessing issue by setting the start method to 'spawn'
+if __name__ == "__main__":
+    # This must happen at the beginning before any other multiprocessing code
+    multiprocessing.set_start_method('spawn', force=True)
 
 # First, verify that the imported packages will be compatible
 try:
