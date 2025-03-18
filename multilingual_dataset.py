@@ -153,15 +153,13 @@ class MultilingualVoiceDataset(Dataset):
             waveform_tensor = waveform.unsqueeze(0).unsqueeze(0).to(device)
             audio_tokens = self.mimi.encode(waveform_tensor)[0]
         
-        # Get the device for consistency
-        device = next(self.mimi.parameters()).device
-        
+        # All tensors must be on CPU for DataLoader with pin_memory
         return {
             "text": processed_text,
             "raw_text": text,
-            "text_tokens": torch.tensor(text_tokens, device="cpu"),  # Keep on CPU, moved to GPU in the training loop
-            "audio_tokens": audio_tokens.to(device),                 # Already on the right device
-            "audio_waveform": waveform.to("cpu"),                    # Keep waveform on CPU to save GPU memory
+            "text_tokens": torch.tensor(text_tokens, device="cpu"),  
+            "audio_tokens": audio_tokens.to("cpu"),                 # Move to CPU for DataLoader
+            "audio_waveform": waveform.to("cpu"),                  
             "speaker_id": speaker_id,
             "language": self.language_processor.language_code
         }

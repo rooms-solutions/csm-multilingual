@@ -175,7 +175,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA to avoid forking issues
-        pin_memory=True if args.device == "cuda" else False,
+        pin_memory=False,  # Disable pin_memory to avoid CUDA tensor pinning issues
         drop_last=True,
         collate_fn=multilingual_collate_fn  # Use our custom collate function
     )
@@ -196,7 +196,7 @@ def train(args):
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA
-            pin_memory=True if args.device == "cuda" else False,
+            pin_memory=False,  # Disable pin_memory to avoid CUDA tensor pinning issues
             collate_fn=multilingual_collate_fn  # Use our custom collate function
         )
     
