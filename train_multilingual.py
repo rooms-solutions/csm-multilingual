@@ -102,10 +102,7 @@ def evaluate(model, val_loader, device):
         for batch in val_loader:
             # Prepare input tensors - ensure they're on the right device
             text_tokens = batch["text_tokens"].to(device)
-            audio_tokens = batch["audio_tokens"]
-            # Only move to device if not already there
-            if audio_tokens.device != device:
-                audio_tokens = audio_tokens.to(device)
+            audio_tokens = batch["audio_tokens"].to(device)
             
             # Reset and setup caches
             model.reset_caches()
@@ -242,9 +239,11 @@ def train(args):
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         for batch_idx, batch in enumerate(progress_bar):
-            # Prepare input tensors
+            # Prepare input tensors - text_tokens and audio_tokens need to be on the device
             text_tokens = batch["text_tokens"].to(device)
             audio_tokens = batch["audio_tokens"].to(device)
+            
+            # Note: audio_waveform is now a list (not tensor) and not needed for training
             
             # Reset caches
             model.reset_caches()

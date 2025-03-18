@@ -193,6 +193,7 @@ def multilingual_collate_fn(batch):
     """
     Custom collate function to handle variable length sequences.
     Pads both text_tokens and audio_tokens to the same length within a batch.
+    Keeps audio_waveform as a list since lengths vary significantly.
     """
     # Find the maximum length of text_tokens in the batch
     max_text_length = max(item["text_tokens"].size(0) for item in batch)
@@ -223,13 +224,20 @@ def multilingual_collate_fn(batch):
             padded_audio_tokens[:, :current_length] = audio_tokens
             item["audio_tokens"] = padded_audio_tokens
     
-    # Use default collate for the batch with padded tensors
+    # Create the batch dictionary, handling each type of data appropriately
     elem = batch[0]
-    batch_dict = {
-        key: torch.stack([d[key] for d in batch]) if torch.is_tensor(elem[key]) 
-        else [d[key] for d in batch] 
-        for key in elem
-    }
+    batch_dict = {}
+    
+    for key in elem:
+        if key == "audio_waveform":
+            # Don't stack audio_waveforms - keep as list since lengths vary
+            batch_dict[key] = [d[key] for d in batch]
+        elif torch.is_tensor(elem[key]):
+            # Stack tensors (text_tokens, audio_tokens)
+            batch_dict[key] = torch.stack([d[key] for d in batch])
+        else:
+            # For non-tensor data (strings, etc.)
+            batch_dict[key] = [d[key] for d in batch]
     
     return batch_dict
 
