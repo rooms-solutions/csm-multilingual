@@ -69,15 +69,15 @@ def prepare_language(args, language):
         cmd.extend(["--max_samples", str(args.max_samples)])
     
     logger.info(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    # Run subprocess with output going directly to console
+    result = subprocess.run(cmd, capture_output=False, text=True)
     
     if result.returncode != 0:
-        logger.error(f"Failed to prepare {language} data:")
-        logger.error(result.stderr)
+        logger.error(f"Failed to prepare {language} data")
         return False
     
     logger.info(f"Successfully prepared data for {language}")
-    logger.debug(result.stdout)
     return True
 
 def train_language(args, language):
@@ -125,15 +125,15 @@ def train_language(args, language):
         cmd.append("--use_amp")
     
     logger.info(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    # Run subprocess with output going directly to console
+    result = subprocess.run(cmd, capture_output=False, text=True)
     
     if result.returncode != 0:
-        logger.error(f"Failed to train model for {language}:")
-        logger.error(result.stderr)
+        logger.error(f"Failed to train model for {language}")
         return False
     
     logger.info(f"Successfully trained model for {language}")
-    logger.debug(result.stdout)
     return True
 
 def main():
