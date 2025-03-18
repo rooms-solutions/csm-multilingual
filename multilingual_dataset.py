@@ -47,7 +47,18 @@ class MultilingualVoiceDataset(Dataset):
         self.voice_frame = pd.read_csv(csv_file, delimiter='\t')
         self.root_dir = root_dir
         self.text_tokenizer = text_tokenizer
-        self.mimi = mimi_model
+        # Ensure the Mimi model is properly loaded
+        if mimi_model is None:
+            from moshi.models import loaders
+            from huggingface_hub import hf_hub_download
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print("Mimi model not provided, downloading and initializing...")
+            mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
+            self.mimi = loaders.get_mimi(mimi_weight, device=device)
+            self.mimi.set_num_codebooks(32)
+        else:
+            self.mimi = mimi_model
         self.max_audio_length = max_audio_length
         
         # Get appropriate language processor

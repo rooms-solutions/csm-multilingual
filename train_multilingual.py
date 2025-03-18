@@ -116,8 +116,12 @@ def train(args):
     # Load text tokenizer
     text_tokenizer = load_llama3_tokenizer()
     
-    # Load audio tokenizer (Mimi)
-    mimi_model = loaders.get_mimi(loaders.MIMI_NAME, device=device)
+    # Load audio tokenizer (Mimi) - download weights first
+    from huggingface_hub import hf_hub_download
+    logger.info("Downloading Mimi codec weights...")
+    mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
+    logger.info(f"Downloaded Mimi codec weights to {mimi_weight}")
+    mimi_model = loaders.get_mimi(mimi_weight, device=device)
     mimi_model.set_num_codebooks(32)
     
     # Initialize the model
