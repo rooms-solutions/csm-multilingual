@@ -69,7 +69,7 @@ def process_audio_file(params):
                 break
                 
         if clip_path is None:
-            logger.warning(f"Audio file not found: {row[col_names['path']]} - tried paths: {possible_paths}")
+            # Simply return None without logging each missing file to reduce log clutter
             return None
             
         # Load and resample audio
@@ -174,6 +174,9 @@ def prepare_commonvoice(args):
     # Create a progress bar
     progress_bar = tqdm(total=len(process_params), desc="Processing audio files")
     
+    # Track counts for different outcomes
+    not_found_count = 0
+    
     # Process files in parallel
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # Submit all tasks
@@ -190,7 +193,12 @@ def prepare_commonvoice(args):
                 if processed_count % 100 == 0:
                     elapsed = time.time() - start_time
                     rate = processed_count / elapsed if elapsed > 0 else 0
-                    logger.info(f"Processed {processed_count}/{len(process_params)} files ({rate:.2f} files/sec)")
+                    logger.info(f"Successfully processed {processed_count}/{len(process_params)} files ({rate:.2f} files/sec)")
+            elif future_to_params[future] is not None:
+                # This counts files that were skipped due to not being found
+                not_found_count += 1
+                if not_found_count % 100 == 0:
+                    logger.warning(f"Not found count: {not_found_count} files")
             
             # Update progress bar
             progress_bar.update(1)
@@ -199,8 +207,14 @@ def prepare_commonvoice(args):
     
     # Log final stats
     total_time = time.time() - start_time
-    logger.info(f"Finished processing {processed_count} files in {total_time:.2f} seconds")
-    logger.info(f"Success rate: {len(processed_data)}/{processed_count} ({len(processed_data)/processed_count*100:.2f}%)")
+    processed_count = len(process_params)  # Total files attempted
+    found_count = processed_count - process_params.count(None)  # Files that were found
+    success_count = len(processed_data)  # Files successfully processed
+    
+    logger.info(f"Finished in {total_time:.2f} seconds")
+    logger.info(f"Files found: {found_count}/{processed_count} ({found_count/processed_count*100:.2f}%)")
+    logger.info(f"Files successfully processed: {success_count}/{found_count} ({success_count/found_count*100:.2f}% of found files)")
+    logger.info(f"Overall success rate: {success_count}/{processed_count} ({success_count/processed_count*100:.2f}%)")
     
     # Create new TSV file
     output_tsv = os.path.join(args.output_dir, f"processed_{args.language}.tsv")
