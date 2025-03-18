@@ -67,8 +67,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
     num_codebooks = audio_tokens.size(1)
     total_loss = 0
     
-    # First codebook prediction using the backbone output
-    c0_logits = model.codebook0_head(last_h.squeeze(1))
+    # First codebook prediction using the backbone output - ensure consistent dtype
+    c0_logits = model.codebook0_head(last_h.squeeze(1).to(dtype=dtype))
     # Extract target as 1D tensor - cross_entropy expects class indices, not multi-dimensional targets
     if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
         c0_targets = audio_tokens[:, 0, 0]  # Get first token of first codebook for each batch item
@@ -100,8 +100,11 @@ def process_batch(model, text_tokens, audio_tokens, device):
         decoder_input = model.projection(curr_h).to(dtype=dtype)
         decoder_h = model.decoder(decoder_input, input_pos=curr_pos, mask=curr_decoder_mask)
         
-        # Get logits and targets
-        ci_logits = torch.matmul(decoder_h[:, -1, :].unsqueeze(1), model.audio_head[i-1]).squeeze(1)
+        # Ensure decoder_h has the correct dtype
+        decoder_h = decoder_h.to(dtype=dtype)
+        
+        # Get logits and targets with proper dtype consistency
+        ci_logits = torch.matmul(decoder_h[:, -1, :].unsqueeze(1), model.audio_head[i-1].to(dtype=dtype)).squeeze(1)
         
         # Extract target as 1D tensor
         if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
