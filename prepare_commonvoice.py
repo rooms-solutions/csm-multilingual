@@ -43,14 +43,11 @@ def prepare_commonvoice(args):
     # Load the validated.tsv file
     tsv_path = os.path.join(args.input_dir, "validated.tsv")
     print(f"Loading data from {tsv_path}")
-    df = pd.read_csv(tsv_path, delimiter='\t', quoting=csv.QUOTE_NONE)
+    df = pd.read_csv(tsv_path, delimiter='\t', quoting=csv.QUOTE_NONE, low_memory=False)
+    print(f"Columns in dataset: {df.columns.tolist()}")
     
-    # Filter by various criteria
-    if args.max_duration:
-        df = df[df['duration'] <= args.max_duration]
-    
-    if args.min_duration:
-        df = df[df['duration'] >= args.min_duration]
+    # Note: Duration filtering will be done after loading audio files
+    # since the 'duration' column isn't available in the dataset
     
     # Get column names for this language
     col_names = language_processor.get_commonvoice_column_indices()
@@ -91,12 +88,21 @@ def prepare_commonvoice(args):
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, waveform, 24000)
             
+            # Calculate duration from waveform
+            duration_seconds = waveform.size(1) / 24000
+            
+            # Apply duration filtering here
+            if args.max_duration and duration_seconds > args.max_duration:
+                continue
+            if args.min_duration and duration_seconds < args.min_duration:
+                continue
+                
             # Add to processed data
             processed_data.append({
                 'path': row[col_names["path"]],
                 'sentence': normalized_text,
                 'original_sentence': text,
-                'duration': waveform.size(1) / 24000,
+                'duration': duration_seconds,
                 'language': args.language,
                 'gender': row.get(col_names["gender"], ''),
                 'client_id': row.get(col_names["client_id"], ''),
@@ -107,6 +113,10 @@ def prepare_commonvoice(args):
             if len(processed_data) >= args.max_samples and args.max_samples > 0:
                 print(f"Reached maximum sample count: {args.max_samples}")
                 break
+                
+            # Print progress occasionally
+            if len(processed_data) % 100 == 0:
+                print(f"Processed {len(processed_data)} clips so far")
                 
         except Exception as e:
             print(f"Error processing {clip_path}: {e}")
