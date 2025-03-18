@@ -45,7 +45,7 @@ def prepare_language(args, language):
     logger.info(f"Preparing data for language: {language}")
     
     # Locate the common voice directory for this language
-    cv_dir = os.path.join(args.common_voice_root, f"cv-corpus-{args.cv_version}-{language}")
+    cv_dir = os.path.join(args.common_voice_root, language)
     if not os.path.exists(cv_dir):
         logger.warning(f"Common Voice directory not found for {language}: {cv_dir}")
         return False
