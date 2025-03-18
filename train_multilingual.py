@@ -52,6 +52,10 @@ def process_batch(model, text_tokens, audio_tokens, device):
     curr_backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
     backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
     
+    # Get model's dtype and ensure consistent dtype for operations
+    dtype = next(model.parameters()).dtype
+    backbone_output = backbone_output.to(dtype=dtype)
+    
     # Last hidden state for each sequence
     last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
     
@@ -74,7 +78,9 @@ def process_batch(model, text_tokens, audio_tokens, device):
     for i in range(1, num_codebooks):
         # Use the decoder to predict next codebook
         curr_decoder_mask = _index_causal_mask(model.decoder_causal_mask, curr_pos)
-        decoder_h = model.decoder(model.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask)
+        # Ensure input to decoder is using the correct dtype
+        decoder_input = model.projection(curr_h).to(dtype=dtype)
+        decoder_h = model.decoder(decoder_input, input_pos=curr_pos, mask=curr_decoder_mask)
         
         # Get logits and targets
         ci_logits = torch.matmul(decoder_h[:, -1, :].unsqueeze(1), model.audio_head[i-1]).squeeze(1)
