@@ -1,6 +1,25 @@
 import argparse
 import os
-import pandas as pd
+import sys
+
+# Try importing pandas with error handling
+try:
+    import pandas as pd
+    import numpy as np
+    print(f"Using pandas {pd.__version__} with numpy {np.__version__}")
+except ImportError as e:
+    print(f"ERROR: Dependency issue: {e}")
+    print("Please install the required packages with: pip install -r requirements.txt")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: Package compatibility issue: {e}")
+    print("This might be due to numpy/pandas version mismatch.")
+    print("Try creating a new virtual environment and installing packages from requirements.txt")
+    print("  python -m venv venv")
+    print("  source venv/bin/activate")
+    print("  pip install -r requirements.txt")
+    sys.exit(1)
+
 import torchaudio
 import torch
 import csv
