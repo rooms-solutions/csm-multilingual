@@ -146,14 +146,20 @@ class MultilingualVoiceDataset(Dataset):
         # Tokenize text
         text_tokens = self.text_tokenizer.encode(formatted_text)
         
-        # Tokenize audio using Mimi
+        # Tokenize audio using Mimi - ensure device match
+        device = next(self.mimi.parameters()).device  # Get Mimi model device
         with torch.no_grad():
+            # Move waveform to the same device as Mimi model
+            waveform = waveform.to(device)
             audio_tokens = self.mimi.encode(waveform.unsqueeze(0).unsqueeze(0))[0]
+        
+        # Get the device for consistency
+        device = next(self.mimi.parameters()).device
         
         return {
             "text": processed_text,
             "raw_text": text,
-            "text_tokens": torch.tensor(text_tokens),
+            "text_tokens": torch.tensor(text_tokens, device="cpu"),  # Keep on CPU, will be moved to GPU in batch
             "audio_tokens": audio_tokens,
             "audio_waveform": waveform,
             "speaker_id": speaker_id,
