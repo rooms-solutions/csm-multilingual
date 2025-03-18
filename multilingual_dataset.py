@@ -192,7 +192,7 @@ class GermanVoiceDataset(MultilingualVoiceDataset):
 def multilingual_collate_fn(batch):
     """
     Custom collate function to handle variable length sequences.
-    Pads text_tokens to the same length within a batch.
+    Pads both text_tokens and audio_tokens to the same length within a batch.
     """
     # Find the maximum length of text_tokens in the batch
     max_text_length = max(item["text_tokens"].size(0) for item in batch)
@@ -203,6 +203,25 @@ def multilingual_collate_fn(batch):
         padded_text_tokens = torch.zeros(max_text_length, dtype=text_tokens.dtype, device=text_tokens.device)
         padded_text_tokens[:text_tokens.size(0)] = text_tokens
         item["text_tokens"] = padded_text_tokens
+    
+    # Find the maximum dimensions for audio_tokens
+    # audio_tokens shape is [num_codebooks, sequence_length]
+    max_audio_length = max(item["audio_tokens"].size(1) for item in batch)
+    num_codebooks = batch[0]["audio_tokens"].size(0)  # Should be the same for all items
+    
+    # Create padded audio_tokens
+    for item in batch:
+        audio_tokens = item["audio_tokens"]
+        current_length = audio_tokens.size(1)
+        if current_length < max_audio_length:
+            # Create padded tensor and copy original data
+            padded_audio_tokens = torch.zeros(
+                (num_codebooks, max_audio_length), 
+                dtype=audio_tokens.dtype, 
+                device=audio_tokens.device
+            )
+            padded_audio_tokens[:, :current_length] = audio_tokens
+            item["audio_tokens"] = padded_audio_tokens
     
     # Use default collate for the batch with padded tensors
     elem = batch[0]
