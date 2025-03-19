@@ -39,9 +39,9 @@ def safe_matmul(tensor1, tensor2, device):
     else:
         actual_device = device
     
-    # Clone tensors to avoid modifying the originals and ensure they're on the right device
-    tensor1_safe = tensor1.detach().clone().to(device=actual_device, non_blocking=False)
-    tensor2_safe = tensor2.detach().clone().to(device=actual_device, non_blocking=False)
+    # Move tensors to correct device WITHOUT detaching to preserve gradients
+    tensor1_safe = tensor1.to(device=actual_device, non_blocking=False)
+    tensor2_safe = tensor2.to(device=actual_device, non_blocking=False)
     
     # Force synchronization
     if actual_device.type == "cuda":
@@ -169,8 +169,8 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             c0_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
         except Exception as e:
             logger.error(f"Error in c0 loss calculation: {e}")
-            # Fallback with very careful input handling
-            c0_logits_safe = torch.nan_to_num(c0_logits.detach().clone(), nan=0.0)
+            # Fallback with very careful input handling - preserve gradients
+            c0_logits_safe = torch.nan_to_num(c0_logits, nan=0.0)
             c0_loss = nn.functional.cross_entropy(c0_logits_safe, c0_targets)
         
         total_loss += c0_loss
@@ -261,8 +261,8 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
             except Exception as e:
                 logger.error(f"Error in ci_loss calculation for codebook {i}: {e}")
-                # Fallback with careful input handling
-                ci_logits_safe = torch.nan_to_num(ci_logits.detach().clone(), nan=0.0)
+                # Fallback with careful input handling - preserve gradients
+                ci_logits_safe = torch.nan_to_num(ci_logits, nan=0.0)
                 ci_loss = nn.functional.cross_entropy(ci_logits_safe, ci_targets, reduction='mean')
             
             total_loss += ci_loss
@@ -354,9 +354,9 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                     ci_logits = safe_matmul(decoder_output, audio_head, device)
                 except Exception as mm_err:
                     logger.error(f"Matrix multiplication error in simplified decoder: {mm_err}")
-                    # Create fallback logits
+                    # Create fallback logits - without detaching to maintain gradients
                     vocab_size = model.args.audio_vocab_size
-                    ci_logits = torch.zeros(decoder_output.size(0), vocab_size, device=device, dtype=dtype)
+                    ci_logits = torch.zeros(decoder_output.size(0), vocab_size, device=device, dtype=dtype, requires_grad=True)
                 
             else:
                 # Fallback to original approach if simplified decoders not available
@@ -404,13 +404,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                     if "device" in str(e).lower():
                         # Last attempt with completely new tensors
                         logger.warning("Matmul device error, making final attempt with new tensors")
-                        # Create new tensors directly on device
+                        # Create new tensors directly on device - without detaching
                         with torch.cuda.device(device):
-                            # Copy data to new tensors
-                            decoder_h_flat_new = torch.zeros_like(decoder_h_flat, device=device, dtype=dtype)
-                            decoder_h_flat_new.copy_(decoder_h_flat)
-                            audio_head_new = torch.zeros_like(audio_head, device=device, dtype=dtype)
-                            audio_head_new.copy_(audio_head)
+                            # Move tensors to device preserving gradients
+                            decoder_h_flat_new = decoder_h_flat.to(device=device, dtype=dtype, non_blocking=False)
+                            audio_head_new = audio_head.to(device=device, dtype=dtype, non_blocking=False)
                             torch.cuda.synchronize(device)
                             ci_logits = torch.matmul(decoder_h_flat_new, audio_head_new)
                     else:
@@ -452,11 +450,12 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                         ci_embed = ci_embed.to(device=device, dtype=dtype)
                 except Exception as embed_err:
                     logger.error(f"Error in audio embedding for position {i}: {embed_err}")
-                    # Create fallback embedding
+                    # Create fallback embedding that supports gradient flow
                     embed_dim = decoder_h.size(-1)
                     ci_embed = torch.zeros(
                         decoder_h.size(0), 1, embed_dim, 
-                        device=device, dtype=dtype
+                        device=device, dtype=dtype,
+                        requires_grad=True
                     )
             
                 # Fix dimensions - ensure consistent shape
@@ -525,7 +524,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             # Calculate loss for just first codebook with numerical stability
             c0_targets = c0_targets.view(-1)
             
-            # Clean up logits to prevent NaN
+            # Clean up logits to prevent NaN - but maintain gradient flow
             c0_logits = torch.nan_to_num(c0_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             
             # Apply scaling to prevent extreme values
