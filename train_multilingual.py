@@ -328,7 +328,6 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 
                 # Add more detailed shape debugging when debug flag is set
                 if args is not None and getattr(args, 'debug', False):
-                    logger.debug(f"x shape: {x.shape}")
                     logger.debug(f"decoder_input shape: {decoder_input.shape}")
                     logger.debug(f"decoder_positions shape: {decoder_positions.shape}")
                     logger.debug(f"decoder_mask shape: {decoder_mask.shape}")
