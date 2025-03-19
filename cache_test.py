@@ -133,8 +133,8 @@ def test_single_batch(language="de", batch_size=4, data_dir="./data"):
     decoder_mask = torch.tril(torch.ones(2, 2, dtype=torch.bool, device=device)).unsqueeze(0).expand(b, 2, 2)
     print(f"Decoder mask shape: {decoder_mask.shape}")
     
-    # Create random decoder input
-    decoder_input = torch.randn(b, 2, model.decoder.embed_dim, device=device, dtype=next(model.parameters()).dtype)
+    # Create random decoder input - use projection's output dimension which matches decoder input dimension
+    decoder_input = torch.randn(b, 2, model.projection.out_features, device=device, dtype=next(model.parameters()).dtype)
     print(f"Decoder input shape: {decoder_input.shape}")
     
     # Forward pass through decoder
