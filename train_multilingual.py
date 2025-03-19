@@ -842,7 +842,8 @@ def train(args):
                     if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
                         logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
                         # Reset the loss to a stable value
-                        normalized_loss = torch.tensor(1.0, device=device, dtype=dtype, requires_grad=True)
+                        model_dtype = next(model.parameters()).dtype
+                        normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
                     
                     scaler.scale(normalized_loss).backward()
                     
@@ -897,7 +898,8 @@ def train(args):
                 if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
                     logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
                     # Reset the loss to a stable value
-                    normalized_loss = torch.tensor(1.0, device=device, dtype=dtype, requires_grad=True)
+                    model_dtype = next(model.parameters()).dtype
+                    normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
                 
                 normalized_loss.backward()
                 
