@@ -552,12 +552,20 @@ def train(args):
     
     # Create model with appropriate precision for the selected device
     with torch.cuda.device(device):
-        # When using AMP, use Float16 instead of BFloat16 for better compatibility
-        model_dtype = torch.float16 if args.use_amp else torch.bfloat16
+        # Always use Float16 instead of BFloat16 when using AMP or when explicitly requested
+        model_dtype = torch.float16 if (args.use_amp or args.force_float16) else torch.bfloat16
         model = Model(model_args).to(device=device, dtype=model_dtype)
         # Force synchronization to ensure model is fully on device
         torch.cuda.synchronize(device)
-        logger.info(f"Model initialized with dtype: {model_dtype}")
+        logger.info(f"Model initialized with dtype: {model_dtype} on device {device}")
+        
+        # Extra check to ensure model is actually using the requested dtype
+        actual_dtype = next(model.parameters()).dtype
+        if actual_dtype != model_dtype:
+            logger.warning(f"Model dtype mismatch: requested {model_dtype} but got {actual_dtype}")
+            logger.warning("Converting model to requested dtype")
+            model = model.to(dtype=model_dtype)
+            torch.cuda.synchronize(device)
         
         # Use our custom attention module instead of simplified decoder
         logger.info("Replacing decoder attention with fixed implementation")
@@ -650,11 +658,39 @@ def train(args):
         T_max=len(train_loader) * args.num_epochs
     )
     
-    # Mixed precision training with proper dtype handling
+    # Mixed precision training with proper dtype handling for BFloat16 compatibility
     if args.use_amp:
         try:
             logger.info("Initializing gradient scaler for mixed precision training")
+            # When using AMP, we need to use a different approach for BFloat16
+            if args.force_float16 or args.amp_compatibility_mode:
+                logger.info("Using Float16 for AMP compatibility")
+                # Convert model to Float16 if it's currently BFloat16
+                if next(model.parameters()).dtype == torch.bfloat16:
+                    logger.info("Converting model from BFloat16 to Float16 for AMP compatibility")
+                    model = model.to(dtype=torch.float16)
             scaler = GradScaler('cuda', enabled=True)
+            # Test scaler functionality - this will catch compatibility issues early
+            dummy_tensor = torch.tensor([1.0], device=device, requires_grad=True)
+            dummy_optimizer = optim.AdamW([dummy_tensor], lr=0.001)
+            with autocast('cuda'):
+                dummy_loss = dummy_tensor * 2
+            scaler.scale(dummy_loss).backward()
+            try:
+                scaler.unscale_(dummy_optimizer)
+                scaler.step(dummy_optimizer)
+                scaler.update()
+                logger.info("AMP gradient scaler test successful")
+            except RuntimeError as test_err:
+                if "BFloat16" in str(test_err) or "not implemented" in str(test_err):
+                    logger.warning(f"AMP compatibility test failed: {test_err}")
+                    logger.warning("Enabling amp_compatibility_mode and converting to float16")
+                    args.amp_compatibility_mode = True
+                    model = model.to(dtype=torch.float16)
+                    # Recreate the scaler
+                    scaler = GradScaler('cuda', enabled=True)
+                else:
+                    raise
         except Exception as e:
             logger.warning(f"Error initializing gradient scaler: {e}")
             logger.warning("Falling back to non-AMP training")
@@ -716,11 +752,21 @@ def train(args):
                     # Only update weights after accumulating gradients for specified steps
                     if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
                         try:
-                            # Unscale gradients - this is where the error happens with BFloat16
-                            # Skip unscaling in compatibility mode
+                            # Unscale gradients with BFloat16 compatibility handling
                             if not args.amp_compatibility_mode:
-                                scaler.unscale_(optimizer)
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                                try:
+                                    # Try normal unscaling first
+                                    scaler.unscale_(optimizer)
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                                except RuntimeError as unscale_err:
+                                    if "BFloat16" in str(unscale_err) or "not implemented" in str(unscale_err):
+                                        logger.warning(f"Runtime error in unscale: {unscale_err}")
+                                        logger.warning("Applying fixed scaling as fallback")
+                                        # Apply fixed scaling as a fallback
+                                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip * 128.0)
+                                    else:
+                                        # For non-BFloat16 errors, we let them propagate
+                                        raise
                             else:
                                 # In compatibility mode, apply a fixed scaling to avoid unscale operation
                                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip * 128.0)
@@ -857,6 +903,8 @@ def main():
                         help="Number of updates steps to accumulate before backward pass")
     parser.add_argument("--amp_compatibility_mode", action="store_true",
                         help="Use compatibility mode for AMP with BFloat16 (skips unscale operation)")
+    parser.add_argument("--force_float16", action="store_true",
+                        help="Force Float16 precision instead of BFloat16 for better AMP compatibility")
     
     args = parser.parse_args()
     

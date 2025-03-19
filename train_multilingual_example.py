@@ -136,6 +136,9 @@ def train_language(args, language):
         
     if args.amp_compatibility_mode:
         cmd.append("--amp_compatibility_mode")
+        
+    if args.force_float16:
+        cmd.append("--force_float16")
     
     # Add gradient accumulation and num_workers if specified
     if args.gradient_accumulation_steps > 1:
@@ -196,6 +199,8 @@ def main():
                         help="Use automatic mixed precision")
     parser.add_argument("--amp_compatibility_mode", action="store_true",
                         help="Use compatibility mode for AMP with BFloat16")
+    parser.add_argument("--force_float16", action="store_true",
+                        help="Force Float16 precision instead of BFloat16 for better AMP compatibility")
     
     # Workflow control
     parser.add_argument("--prepare_only", action="store_true",
