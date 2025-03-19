@@ -7,30 +7,63 @@ class FixedPositionRoPE(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
+        half_dim = dim // 2
+        
         # Precompute sin/cos for positions 0 and 1 only
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, dtype=torch.float) / half_dim))
         
         # Only compute for positions 0 and 1
         self.register_buffer("cos_cached", torch.cos(torch.outer(torch.tensor([0.0, 1.0]), inv_freq)))
         self.register_buffer("sin_cached", torch.sin(torch.outer(torch.tensor([0.0, 1.0]), inv_freq)))
     
     def forward(self, x, position_ids):
-        # x: [batch, seq_len, heads, head_dim]
+        """Apply RoPE with careful dimension handling."""
         batch, seq_len, heads, dim = x.shape
-        # Clamp positions to 0 or 1
-        position_ids = torch.clamp(position_ids, max=1)
+        half_dim = dim // 2
         
-        # Select the precomputed sin/cos for positions 0 and 1
-        cos = self.cos_cached[position_ids].view(batch, seq_len, 1, dim//2, 1)  # [batch, seq, 1, dim//2, 1]
-        sin = self.sin_cached[position_ids].view(batch, seq_len, 1, dim//2, 1)
+        # Handle position IDs to ensure correct format
+        if position_ids.dim() == 1:
+            # Expand to batch size
+            position_ids = position_ids.unsqueeze(0).expand(batch, -1)
         
-        # Apply RoPE rotation
-        x_reshape = x.view(batch, seq_len, heads, dim//2, 2)
-        x_out = torch.empty_like(x_reshape)
-        x_out[..., 0] = x_reshape[..., 0] * cos - x_reshape[..., 1] * sin
-        x_out[..., 1] = x_reshape[..., 1] * cos + x_reshape[..., 0] * sin
+        # Ensure right sequence length and clamp to valid values
+        if position_ids.size(1) != seq_len:
+            # Create position IDs for sequence length
+            new_pos_ids = torch.zeros(batch, seq_len, dtype=torch.long, device=x.device)
+            # Copy existing IDs
+            copy_len = min(seq_len, position_ids.size(1))
+            new_pos_ids[:, :copy_len] = position_ids[:, :copy_len]
+            # Default remaining positions to 1
+            if copy_len < seq_len:
+                new_pos_ids[:, copy_len:] = 1
+            position_ids = new_pos_ids
         
-        return x_out.view(batch, seq_len, heads, dim)
+        # Clamp to valid values (0 or 1)
+        position_ids = position_ids.clamp(max=1).long()
+        
+        # Split input into real and imaginary parts
+        x_real = x[..., :half_dim]  # First half
+        x_imag = x[..., half_dim:]  # Second half
+        
+        # Initialize output tensors
+        out_real = torch.zeros_like(x_real)
+        out_imag = torch.zeros_like(x_imag)
+        
+        # Apply rotations for each position without complex reshaping
+        for b in range(batch):
+            for s in range(seq_len):
+                pos = position_ids[b, s].item()
+                
+                # Get rotation factors for this position
+                cos = self.cos_cached[pos]  # [half_dim]
+                sin = self.sin_cached[pos]  # [half_dim]
+                
+                # Perform rotation (complex multiplication)
+                out_real[b, s] = x_real[b, s] * cos.unsqueeze(0) - x_imag[b, s] * sin.unsqueeze(0)
+                out_imag[b, s] = x_imag[b, s] * cos.unsqueeze(0) + x_real[b, s] * sin.unsqueeze(0)
+        
+        # Combine real and imaginary parts
+        return torch.cat([out_real, out_imag], dim=-1)
 
 
 class SimpleDecoderAttention(nn.Module):
@@ -74,8 +107,10 @@ class SimpleDecoderAttention(nn.Module):
                 # Use input_pos if provided (compatibility with original interface)
                 position_ids = input_pos
             else:
-                # Default to [0, 1] positions
-                position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
+                # For our fixed 2-position case, explicitly create [0, 1] positions
+                position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
+                if seq_len > 1:
+                    position_ids[:, 1:] = 1  # Position 0 for first token, 1 for all others
         
         # Ensure input is on the correct device and has the right dtype
         device = x.device

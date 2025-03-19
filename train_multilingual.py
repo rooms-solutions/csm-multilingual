@@ -228,9 +228,22 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             ).unsqueeze(0).expand(b, 2, 2)
             
             try:
+                # Explicitly ensure all tensors have correct device before passing to decoder
+                decoder_input = decoder_input.to(device=device, dtype=dtype, non_blocking=False)
+                decoder_positions = decoder_positions.to(device=device, non_blocking=False)
+                decoder_mask = decoder_mask.to(device=device, non_blocking=False)
+                
+                # Force synchronize to ensure transfers complete
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                
                 # Now use the proper decoder with our fixed attention implementation
                 # Pass mask as a keyword argument to avoid conflicts and ensure device consistency
-                decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(device=device, dtype=dtype)
+                decoder_h = model.decoder(
+                    decoder_input, 
+                    input_pos=decoder_positions, 
+                    mask=decoder_mask
+                ).to(device=device, dtype=dtype)
                 
                 # Log what we're doing
                 if i == 1:  # Only log once per batch
@@ -238,7 +251,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             except Exception as decoder_err:
                 # Log the specific decoder error
                 logger.error(f"Decoder error: {decoder_err}")
-                # Create a dummy decoder output with proper device/dtype to continue
+                # Fall back to using the projected input directly
                 decoder_h = decoder_input.clone().to(device=device, dtype=dtype)
             
             # Log what we're doing
@@ -312,6 +325,14 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 # Log shapes and devices for debugging
                 logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
                 logger.debug(f"Before matmul - decoder_h_flat device: {decoder_h_flat.device}, audio_head device: {audio_head.device}")
+                
+                # Add more detailed shape debugging when debug flag is set
+                if args is not None and getattr(args, 'debug', False):
+                    logger.debug(f"x shape: {x.shape}")
+                    logger.debug(f"decoder_input shape: {decoder_input.shape}")
+                    logger.debug(f"decoder_positions shape: {decoder_positions.shape}")
+                    logger.debug(f"decoder_mask shape: {decoder_mask.shape}")
+                    logger.debug(f"decoder_h shape: {decoder_h.shape}")
             
                 # Now do the final matmul with our safe matrix multiplication function
                 try:
