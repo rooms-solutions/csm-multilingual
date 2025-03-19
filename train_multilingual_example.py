@@ -119,8 +119,11 @@ def train_language(args, language):
         "--learning_rate", str(args.learning_rate),
         "--num_epochs", str(args.num_epochs),
         "--device", args.device,
-        "--debug"  # Always enable debug logging for better diagnostics
     ]
+    
+    # Only add debug flag if explicitly requested
+    if args.debug:
+        cmd.append("--debug")
     
     if os.path.exists(val_csv):
         cmd.extend(["--val_csv", val_csv])
@@ -187,6 +190,8 @@ def main():
                         help="Initial checkpoint for all languages")
     parser.add_argument("--use_previous", action="store_true",
                         help="Use previous checkpoints when available")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging output")
     
     args = parser.parse_args()
     
