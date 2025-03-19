@@ -923,14 +923,14 @@ def train(args):
                     try:
                         # Apply loss scaling and check that gradients are being computed
                         scaled_loss = scaler.scale(normalized_loss)
-                        
+                    
                         # Verify scaled loss isn't NaN before backward
                         if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
                             logger.warning("Scaled loss is invalid, using unscaled loss instead")
                             normalized_loss.backward()
                         else:
                             scaled_loss.backward()
-                            
+                        
                             # Immediately check for NaN gradients and fix if needed
                             has_nan_grads = False
                             for name, param in model.parameters():
@@ -938,15 +938,21 @@ def train(args):
                                     has_nan_grads = True
                                     logger.warning(f"NaN/Inf in gradients for {name} (after backward)")
                                     param.grad = torch.zeros_like(param.grad)
-                            
+                        
                             if has_nan_grads:
                                 logger.info("Found and fixed NaN gradients during backward pass")
-                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
+                    except Exception as backward_err:
+                        logger.warning(f"Error during backward pass: {backward_err}")
+                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item() if not torch.isnan(normalized_loss).all() else 'NaN'}")
                         # Reset the loss to a stable value
                         model_dtype = next(model.parameters()).dtype
                         normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
                     
-                    scaler.scale(normalized_loss).backward()
+                        # Try a simpler backward pass as fallback
+                        try:
+                            scaler.scale(normalized_loss).backward()
+                        except Exception as fallback_err:
+                            logger.error(f"Fallback backward also failed: {fallback_err}")
                     
                     # Check for NaN gradients after backward
                     grad_issues = check_gradients(model)
