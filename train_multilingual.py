@@ -28,6 +28,39 @@ from multilingual_dataset import create_dataset_for_language, multilingual_colla
 from language_utils import LanguageProcessor
 from custom_decoder import fix_decoder_attention
 
+def safe_matmul(tensor1, tensor2, device):
+    """
+    Perform matrix multiplication with guaranteed device compatibility.
+    This function ensures both tensors are on the same device before multiplication.
+    """
+    # Get the actual CUDA device if using string "cuda"
+    if isinstance(device, str) and device == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            device = torch.device("cpu")
+    
+    # Clone tensors to avoid modifying the originals and ensure they're on the right device
+    tensor1_safe = tensor1.detach().clone().to(device=device, non_blocking=False)
+    tensor2_safe = tensor2.detach().clone().to(device=device, non_blocking=False)
+    
+    # Force synchronization
+    if tensor1_safe.device.type == "cuda" or tensor2_safe.device.type == "cuda":
+        torch.cuda.synchronize()
+    
+    # Double-check device placement
+    if tensor1_safe.device != device:
+        tensor1_safe = tensor1_safe.to(device=device, non_blocking=False)
+    if tensor2_safe.device != device:
+        tensor2_safe = tensor2_safe.to(device=device, non_blocking=False)
+    
+    # Force another synchronization
+    if tensor1_safe.device.type == "cuda" or tensor2_safe.device.type == "cuda":
+        torch.cuda.synchronize()
+    
+    # Perform the matrix multiplication
+    return torch.matmul(tensor1_safe, tensor2_safe)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -99,25 +132,40 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
         # Create a position embedding matrix for each codebook position
         # Explicitly create on device with proper error handling
         try:
+            # Get the actual CUDA device if using string "cuda"
+            cuda_device = device
+            if isinstance(device, str) and device == "cuda":
+                if torch.cuda.is_available():
+                    cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                else:
+                    cuda_device = torch.device("cpu")
+            
             # Ensure proper size from backbone output
             embed_dim = backbone_output.size(-1)
+            
             # Create directly on the device with CUDA synchronization to ensure placement
-            with torch.cuda.device(device):
-                position_embeddings = torch.randn(
-                    num_codebooks-1, 
-                    embed_dim, 
-                    device=device, 
-                    dtype=dtype
-                ) * 0.02
-                # Synchronize to ensure tensor is created before continuing
-                torch.cuda.synchronize(device)
+            position_embeddings = torch.zeros(
+                num_codebooks-1, 
+                embed_dim, 
+                device=cuda_device, 
+                dtype=dtype
+            )
+            
+            # Fill with random values directly on device
+            with torch.no_grad():
+                position_embeddings.normal_(0, 0.02)
+            
+            # Force synchronization
+            if cuda_device.type == "cuda":
+                torch.cuda.synchronize()
                 
             # Verify the device to be certain
-            if position_embeddings.device != device:
-                logger.warning(f"Position embeddings on wrong device: {position_embeddings.device} vs expected {device}")
+            if position_embeddings.device != cuda_device:
+                logger.warning(f"Position embeddings on wrong device: {position_embeddings.device} vs expected {cuda_device}")
                 # Force synchronous copy to device
-                position_embeddings = position_embeddings.to(device=device, dtype=dtype, non_blocking=False)
-                torch.cuda.synchronize(device)
+                position_embeddings = position_embeddings.to(device=cuda_device, dtype=dtype, non_blocking=False)
+                if cuda_device.type == "cuda":
+                    torch.cuda.synchronize()
         except Exception as embed_err:
             logger.error(f"Error creating position embeddings: {embed_err}")
             # Fallback creation with hard-coded size
@@ -145,10 +193,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             # Get audio head and ensure it's definitely on the correct device
             audio_head_i = model.audio_head[i-1].to(device=device, dtype=dtype, non_blocking=False)
             
-            # Get logits by matmul with the audio head - transpose the audio_head for correct multiplication
-            ci_logits = torch.matmul(
-                projected_h.squeeze(1).to(device=device, non_blocking=False),  # Shape: [batch_size, decoder_dim]
-                audio_head_i  # Shape: [decoder_dim, vocab_size]
+            # Get logits by matmul with the audio head using safe_matmul
+            ci_logits = safe_matmul(
+                projected_h.squeeze(1),  # Shape: [batch_size, decoder_dim]
+                audio_head_i,  # Shape: [decoder_dim, vocab_size]
+                device
             )  # Result: [batch_size, vocab_size]
             
             # Extract target
@@ -213,12 +262,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 # Process through the simplified decoder for this position
                 decoder_output = model.simplified_decoders[i-1](decoder_features)
                 
-                # Use the output directly for the logits calculation with explicit device handling
+                # Use the output directly for the logits calculation with our safe_matmul
                 try:
-                    # Ensure both tensors are on same device 
-                    decoder_output = decoder_output.to(device=device, dtype=dtype)
-                    audio_head = model.audio_head[i-1].to(device=device, dtype=dtype) 
-                    ci_logits = torch.matmul(decoder_output, audio_head)
+                    # Use our custom safe_matmul function
+                    audio_head = model.audio_head[i-1]
+                    ci_logits = safe_matmul(decoder_output, audio_head, device)
                 except Exception as mm_err:
                     logger.error(f"Matrix multiplication error in simplified decoder: {mm_err}")
                     # Create fallback logits
@@ -265,20 +313,14 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
                 logger.debug(f"Before matmul - decoder_h_flat device: {decoder_h_flat.device}, audio_head device: {audio_head.device}")
             
-                # Now do the final matmul with guaranteed device matching
+                # Now do the final matmul with our safe matrix multiplication function
                 try:
-                    # Explicitly detach and clone to avoid any reference issues
-                    decoder_h_flat_safe = decoder_h_flat.detach().clone().to(device=device, dtype=dtype, non_blocking=False)
-                    audio_head_safe = audio_head.detach().clone().to(device=device, dtype=dtype, non_blocking=False)
+                    # Use our custom safe_matmul function to guarantee device compatibility
+                    ci_logits = safe_matmul(decoder_h_flat, audio_head, device)
                     
-                    # Force synchronization before operation
-                    torch.cuda.synchronize(device)
-                    
-                    # Check device one more time and log
-                    logger.debug(f"Final check - decoder_h_flat device: {decoder_h_flat_safe.device}, audio_head device: {audio_head_safe.device}")
-                    
-                    # Use safe copies for matmul
-                    ci_logits = torch.matmul(decoder_h_flat_safe, audio_head_safe)
+                    # Log success
+                    if i == 1 and batch_idx < 2:
+                        logger.debug(f"Matrix multiplication successful with safe_matmul for position {i}")
                 except RuntimeError as e:
                     if "device" in str(e).lower():
                         # Last attempt with completely new tensors

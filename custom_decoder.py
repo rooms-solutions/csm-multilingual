@@ -98,11 +98,27 @@ class SimpleDecoderAttention(nn.Module):
         q = self.pos_embed(q, position_ids)
         k = self.pos_embed(k, position_ids)
         
-        # Force tensors to match input device before reshaping
+        # Force tensors to match input device before reshaping, with stronger guarantees
         device, dtype = x.device, x.dtype
-        q = q.to(device=device, dtype=dtype, non_blocking=True)
-        k = k.to(device=device, dtype=dtype, non_blocking=True)
-        v = v.to(device=device, dtype=dtype, non_blocking=True)
+        
+        # Ensure we're using the correct device name format (use actual device object, not string)
+        if isinstance(device, str) and device == "cuda":
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            
+        # Force synchronous copy to device to ensure completion
+        q = q.to(device=device, dtype=dtype, non_blocking=False)
+        k = k.to(device=device, dtype=dtype, non_blocking=False)
+        v = v.to(device=device, dtype=dtype, non_blocking=False)
+        
+        # Verify device placement was successful
+        if q.device != device or k.device != device or v.device != device:
+            # Try again with explicit device index if still mismatched
+            if torch.cuda.is_available():
+                current_device = torch.cuda.current_device()
+                device = torch.device(f"cuda:{current_device}")
+                q = q.to(device=device, dtype=dtype, non_blocking=False)
+                k = k.to(device=device, dtype=dtype, non_blocking=False)
+                v = v.to(device=device, dtype=dtype, non_blocking=False)
         
         # Reshape for attention computation
         q = q.transpose(1, 2)  # [batch, heads, seq, dim]
