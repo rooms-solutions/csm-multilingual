@@ -49,8 +49,19 @@ class SimpleDecoderAttention(nn.Module):
         
         # Use our custom RoPE implementation
         self.pos_embed = FixedPositionRoPE(self.head_dim)
+        
+        # Add cache-related attributes for compatibility
+        self.cache_enabled = False
     
     def forward(self, x, mask=None, position_ids=None, input_pos=None):
+        
+    def caches_are_enabled(self):
+        """Return whether caching is enabled (always False for our implementation)"""
+        return False
+        
+    def reset_caches(self):
+        """No-op since we don't use caches"""
+        pass
         batch_size, seq_len, _ = x.shape
         
         # Default positions if not provided

@@ -5,6 +5,11 @@ import torch.nn as nn
 import torchtune
 from torchtune.models import llama3_2
 
+# Ensure DISABLE_CACHE environment variable is set
+import os
+os.environ["TORCHTUNE_DISABLE_CACHE"] = "1" 
+os.environ["DISABLE_ROPE_CACHE"] = "1"
+
 # Configure logger
 logger = logging.getLogger(__name__)
 
