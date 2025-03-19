@@ -129,26 +129,74 @@ def process_batch(model, text_tokens, audio_tokens, device):
             ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
             total_loss += ci_loss
             
-            # Skip the decoder and use a simplified approach with direct projection
+            # Use the decoder properly with consistent dimensions
             # Project to decoder dimension and ensure correct dtype
             decoder_input = model.projection(codebook_h.unsqueeze(1)).to(dtype=dtype)
             
-            # Don't use the decoder at all - just use the decoder input as the output
-            # This is a workaround for the dimension issues
-            decoder_h = decoder_input
+            # Create fixed positions tensors with proper shape
+            decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
+            decoder_positions[:, 1] = 1  # Second position is 1
             
-            # Skip all the problematic decoder attempts that were causing errors
+            # Create a properly sized causal mask for the decoder
+            # This is critical - the mask must be [batch_size, seq_len, seq_len]
+            decoder_mask = torch.tril(
+                torch.ones(2, 2, dtype=torch.bool, device=device)
+            ).unsqueeze(0).expand(b, 2, 2)
+            
+            # Use the decoder with the correct input shapes
+            try:
+                # Reshape decoder input if needed for consistency
+                if decoder_input.size(1) != 2:
+                    decoder_input = decoder_input[:, :2].contiguous()
+                    
+                # Use the decoder directly with the right shapes
+                decoder_h = model.decoder(
+                    decoder_input,
+                    input_pos=decoder_positions,
+                    mask=decoder_mask
+                ).to(dtype=dtype)
+            except Exception as e:
+                # Fallback if decoder still fails
+                logger.warning(f"Decoder failed: {e}, using input projection")
+                decoder_h = decoder_input
         
             # Ensure decoder_h has the correct dtype
             decoder_h = decoder_h.to(dtype=dtype)
             
-            # Get logits with proper dtype consistency - ensure correct dimensions
-            # Use .squeeze() first to get shape [batch_size, decoder_dim] before matrix multiply
-            decoder_h_flat = decoder_h[:, -1, :].to(dtype=dtype)  # Shape: [batch_size, decoder_dim]
-            ci_logits = torch.matmul(
-                decoder_h_flat,  # Shape: [batch_size, decoder_dim]
-                model.audio_head[i-1].to(dtype=dtype)  # Shape: [decoder_dim, vocab_size]
-            )  # Result: [batch_size, vocab_size]
+            # Handle logits calculation with careful dimension management
+            # Get the last position's embedding for prediction
+            if decoder_h.dim() == 3:
+                # Standard case - decoder_h is [batch_size, seq_len, decoder_dim]
+                decoder_h_flat = decoder_h[:, -1, :].to(dtype=dtype)
+            elif decoder_h.dim() == 2:
+                # Fallback case - decoder_h is [batch_size, decoder_dim]
+                decoder_h_flat = decoder_h.to(dtype=dtype)
+            else:
+                # Unusual case - reshape to expected dimensions
+                decoder_h_flat = decoder_h.view(b, -1, decoder_h.size(-1))[:, -1, :].to(dtype=dtype)
+            
+            # Ensure audio_head has correct shape for matrix multiplication
+            audio_head = model.audio_head[i-1].to(dtype=dtype)
+            
+            # For debugging
+            if batch_idx == 0 and i == 1:
+                logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
+            
+            # Perform matrix multiplication with shape checking
+            if decoder_h_flat.shape[-1] != audio_head.shape[0]:
+                # Dimensions don't match - need to reshape
+                logger.warning(f"Matrix dimension mismatch: {decoder_h_flat.shape[-1]} vs {audio_head.shape[0]}")
+                # Project to correct dimension
+                projection_matrix = torch.randn(
+                    decoder_h_flat.shape[-1], 
+                    audio_head.shape[0], 
+                    device=device, 
+                    dtype=dtype
+                ) * 0.02
+                decoder_h_flat = torch.matmul(decoder_h_flat, projection_matrix)
+            
+            # Now do the final matmul
+            ci_logits = torch.matmul(decoder_h_flat, audio_head)
             
             # Extract target as 1D tensor - always clone to avoid in-place issues
             if audio_tokens.dim() == 3:

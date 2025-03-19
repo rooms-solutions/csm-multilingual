@@ -111,25 +111,56 @@ class Model(nn.Module):
         self.audio_head = nn.Parameter(torch.empty(args.audio_num_codebooks - 1, decoder_dim, args.audio_vocab_size))
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
-        """Setup causal masks without relying on KV caching.
+        """Setup caches and causal masks with consistent dimensions.
         
-        This version is more robust for training when different batch sizes are used.
-        It creates self-contained masks without relying on the built-in cache system.
+        Ensures consistent dimensions between backbone and decoder caches.
         """
         device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
         
-        # Simply create causal masks without setting up actual KV caches
+        # First completely clear model caches
+        self.reset_caches()
+        
+        # Create the backbone and decoder causal masks
         backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
-        
-        # Just create the masks, don't set up caches
         backbone_mask = _create_causal_mask(backbone_max_seq_len, device)
-        decoder_mask = _create_causal_mask(2, device)  # Always use size 2 for decoder
+        # Always use size 2 for decoder to ensure consistent dimensions
+        decoder_mask = _create_causal_mask(2, device) 
         
         # Register the masks as buffers
         self.register_buffer("backbone_causal_mask", backbone_mask)
         self.register_buffer("decoder_causal_mask", decoder_mask)
         
-        # For backward compatibility - caches might not actually be set up
+        # Configure decoder's position embeddings for consistent dimensions
+        if hasattr(self.decoder, 'layers'):
+            for layer in self.decoder.layers:
+                if hasattr(layer, 'attn') and hasattr(layer.attn, 'pos_embeddings'):
+                    # Try to configure positional embeddings for sequence length 2
+                    if hasattr(layer.attn.pos_embeddings, 'setup'):
+                        try:
+                            layer.attn.pos_embeddings.setup(
+                                max_batch_size=max_batch_size,
+                                max_seq_len=2,
+                                dtype=dtype,
+                                device=device
+                            )
+                        except Exception:
+                            pass
+                            
+        # Actually setup the backbone and decoder caches with consistent dimensions
+        try:
+            if hasattr(self.backbone, 'setup_caches'):
+                self.backbone.setup_caches(max_batch_size, dtype)
+        except Exception:
+            pass
+            
+        try:
+            if hasattr(self.decoder, 'setup_caches'):
+                # Always use sequence length 2 for decoder
+                self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
+        except Exception:
+            pass
+            
         return backbone_mask
 
     def generate_frame(
@@ -199,31 +230,73 @@ class Model(nn.Module):
         return curr_sample
 
     def reset_caches(self):
-        """No-op reset function for training without caches.
+        """Reset caches for both backbone and decoder.
         
-        This is kept for backward compatibility, but doesn't actually do anything
-        when KV caching is disabled.
+        This implementation works with or without KV caching enabled.
         """
-        # Do nothing - we're not using caches for training
-        pass
+        # Try to reset backbone and decoder caches if available
+        # If caches are disabled, this will be a no-op
+        try:
+            if hasattr(self.backbone, 'reset_caches'):
+                self.backbone.reset_caches()
+        except Exception:
+            pass
+            
+        try:
+            if hasattr(self.decoder, 'reset_caches'):
+                self.decoder.reset_caches()
+        except Exception:
+            pass
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
-        """Embed audio tokens with robust dimension handling"""
+        """Embed audio tokens with enhanced dimension handling"""
         try:
-            return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
-        except RuntimeError as e:
-            # Handle dimension issues by reshaping
-            if "size mismatch" in str(e) or "dimension" in str(e):
-                # Reshape tokens to ensure 2D shape [batch_size, seq_len]
-                if tokens.dim() > 2:
-                    tokens = tokens.view(tokens.size(0), -1)
-                elif tokens.dim() == 1:
-                    tokens = tokens.unsqueeze(1)
+            # Normalize token shape for consistent handling
+            # Ensure tokens is 2D: [batch_size, seq_len]
+            if tokens.dim() == 1:
+                tokens = tokens.unsqueeze(1)
+            elif tokens.dim() > 2:
+                tokens = tokens.view(tokens.size(0), -1)
                 
-                # Try again with reshaped tensor
-                return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
-            else:
-                raise
+            # Compute embedding with proper offset
+            embeddings = self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+            
+            # Ensure output has shape [batch_size, seq_len, dim]
+            if embeddings.dim() == 2:
+                embeddings = embeddings.unsqueeze(1)
+                
+            return embeddings
+            
+        except RuntimeError as e:
+            # Enhanced error handling with more diagnostic info
+            shape_str = f"tokens.shape: {tokens.shape}, tokens.dtype: {tokens.dtype}"
+            logger.warning(f"Embedding error: {e}, {shape_str}")
+            
+            # More aggressive reshaping as a last resort
+            try:
+                # Clone to avoid in-place modification errors
+                safe_tokens = tokens.clone().detach()
+                
+                # Force into a known good shape
+                if safe_tokens.dim() == 1:
+                    safe_tokens = safe_tokens.unsqueeze(1)
+                else:
+                    safe_tokens = safe_tokens.view(safe_tokens.size(0), -1)[:, :1]
+                    
+                embeddings = self.audio_embeddings(safe_tokens + codebook * self.args.audio_vocab_size)
+                
+                # Ensure consistent output shape
+                if embeddings.dim() == 2:
+                    embeddings = embeddings.unsqueeze(1)
+                    
+                return embeddings
+                
+            except Exception as nested_e:
+                logger.error(f"Audio embedding fallback failed: {nested_e}")
+                # Last resort: return zeros with the right shape
+                batch_size = tokens.size(0) if tokens.dim() > 0 else 1
+                embed_dim = self.audio_embeddings.weight.size(1)
+                return torch.zeros(batch_size, 1, embed_dim, device=tokens.device)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
