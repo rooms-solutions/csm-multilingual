@@ -248,7 +248,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 
                 # Log what we're doing
                 if i == 1:  # Only log once per batch
-                    logger.info("Using fixed decoder implementation with proper attention handling")
+                    logger.debug("Using fixed decoder implementation with proper attention handling")
             except Exception as decoder_err:
                 # Log the specific decoder error
                 logger.error(f"Decoder error: {decoder_err}")
@@ -257,7 +257,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             
             # Log what we're doing
             if i == 1:  # Only log once per batch
-                logger.info("Using fixed decoder implementation with proper attention handling")
+                logger.debug("Using fixed decoder implementation with proper attention handling")
         
             # Ensure decoder_h has the correct dtype
             decoder_h = decoder_h.to(dtype=dtype)
@@ -509,7 +509,7 @@ def train(args):
     if args.debug:
         logger.setLevel(logging.DEBUG)
     else:
-        # Always show some debug info during training
+        # Use INFO level by default (DEBUG is disabled)
         logger.setLevel(logging.INFO)
     
     # Log PyTorch version - helpful for compatibility tracking
