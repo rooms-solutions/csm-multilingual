@@ -209,11 +209,28 @@ class Model(nn.Module):
             curr_decoder_mask = torch.tril(
                 torch.ones(2, 2, dtype=torch.bool, device=curr_h.device)
             ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
+            
+            # Ensure projection output has exactly 2 sequence positions
+            projection_out = self.projection(curr_h)
+            if projection_out.size(1) != 2:
+                # Force to exactly 2 positions
+                if projection_out.size(1) > 2:
+                    # Take first 2 positions
+                    projection_out = projection_out[:, :2]
+                else:
+                    # Repeat last position to get 2 positions
+                    pad = projection_out[:, -1:].expand(-1, 2-projection_out.size(1), -1)
+                    projection_out = torch.cat([projection_out, pad], dim=1)
+            
+            # Ensure curr_pos is exactly [batch, 2] with values [0,1]
+            batch_size = curr_h.size(0)
+            curr_pos = torch.zeros((batch_size, 2), dtype=torch.long, device=curr_h.device)
+            curr_pos[:, 1] = 1  # Set second position to 1
                 
             # Use our fixed decoder that properly handles the positions
             # Use kwargs-style for mask to avoid parameter conflicts
             decoder_h = self.decoder(
-                self.projection(curr_h), 
+                projection_out, 
                 input_pos=curr_pos, 
                 mask=curr_decoder_mask
             ).to(dtype=dtype)

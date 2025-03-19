@@ -238,7 +238,27 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                     torch.cuda.synchronize(device)
                 
                 # Now use the proper decoder with our fixed attention implementation
-                # Pass mask as a keyword argument to avoid conflicts and ensure device consistency
+                # Make sure decoder_input has exactly 2 sequence positions [batch, 2, dim]
+                if decoder_input.size(1) != 2:
+                    # Adjust to exactly 2 sequence positions
+                    if decoder_input.size(1) > 2:
+                        # Truncate to 2 positions
+                        decoder_input = decoder_input[:, :2, :]
+                    else:
+                        # Pad to 2 positions by duplicating the last position
+                        pad = decoder_input[:, -1:, :].expand(-1, 2-decoder_input.size(1), -1)
+                        decoder_input = torch.cat([decoder_input, pad], dim=1)
+                
+                # Make sure decoder_positions is exactly [batch, 2] with values [0,1]
+                decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
+                decoder_positions[:, 1] = 1  # Set second position to 1
+            
+                # Verify decoder mask has the right dimensions [batch, 2, 2]
+                decoder_mask = torch.tril(
+                    torch.ones(2, 2, dtype=torch.bool, device=device)
+                ).unsqueeze(0).expand(b, 2, 2)
+            
+                # Pass to decoder with corrected dimensions
                 decoder_h = model.decoder(
                     decoder_input, 
                     input_pos=decoder_positions, 

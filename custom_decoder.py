@@ -21,46 +21,41 @@ class FixedPositionRoPE(nn.Module):
         batch, seq_len, heads, dim = x.shape
         half_dim = dim // 2
         
-        # Handle position IDs to ensure correct format
+        # Ensure position_ids always has the right dimensions [batch_size, seq_len]
         if position_ids.dim() == 1:
             # Expand to batch size
             position_ids = position_ids.unsqueeze(0).expand(batch, -1)
         
-        # Ensure right sequence length and clamp to valid values
+        # Very important: Ensure position_ids has exactly seq_len positions
         if position_ids.size(1) != seq_len:
-            # Create position IDs for sequence length
-            new_pos_ids = torch.zeros(batch, seq_len, dtype=torch.long, device=x.device)
-            # Copy existing IDs
-            copy_len = min(seq_len, position_ids.size(1))
-            new_pos_ids[:, :copy_len] = position_ids[:, :copy_len]
-            # Default remaining positions to 1
-            if copy_len < seq_len:
-                new_pos_ids[:, copy_len:] = 1
-            position_ids = new_pos_ids
+            # Always resize to exact sequence length
+            if position_ids.size(1) > seq_len:
+                # Truncate
+                position_ids = position_ids[:, :seq_len]
+            else:
+                # Pad with position 1 (we need exactly 2 positions for our case)
+                pad_len = seq_len - position_ids.size(1)
+                pad = torch.ones(batch, pad_len, dtype=torch.long, device=position_ids.device)
+                position_ids = torch.cat([position_ids, pad], dim=1)
         
         # Clamp to valid values (0 or 1)
         position_ids = position_ids.clamp(max=1).long()
         
-        # Split input into real and imaginary parts
-        x_real = x[..., :half_dim]  # First half
-        x_imag = x[..., half_dim:]  # Second half
+        # Simpler, more efficient implementation using broadcasting
+        # Get embeddings for all positions in the batch at once
+        cos_pos = self.cos_cached[position_ids]  # [batch, seq_len, half_dim]
+        sin_pos = self.sin_cached[position_ids]  # [batch, seq_len, half_dim]
         
-        # Initialize output tensors
-        out_real = torch.zeros_like(x_real)
-        out_imag = torch.zeros_like(x_imag)
+        # Reshape for broadcasting across heads
+        cos_pos = cos_pos.unsqueeze(2).expand(-1, -1, heads, -1)  # [batch, seq_len, heads, half_dim]
+        sin_pos = sin_pos.unsqueeze(2).expand(-1, -1, heads, -1)  # [batch, seq_len, heads, half_dim]
         
-        # Apply rotations for each position without complex reshaping
-        for b in range(batch):
-            for s in range(seq_len):
-                pos = position_ids[b, s].item()
-                
-                # Get rotation factors for this position
-                cos = self.cos_cached[pos]  # [half_dim]
-                sin = self.sin_cached[pos]  # [half_dim]
-                
-                # Perform rotation (complex multiplication)
-                out_real[b, s] = x_real[b, s] * cos.unsqueeze(0) - x_imag[b, s] * sin.unsqueeze(0)
-                out_imag[b, s] = x_imag[b, s] * cos.unsqueeze(0) + x_real[b, s] * sin.unsqueeze(0)
+        # Split x into real and imaginary parts
+        x_real, x_imag = x[..., :half_dim], x[..., half_dim:]
+        
+        # Apply rotary embeddings
+        out_real = x_real * cos_pos - x_imag * sin_pos
+        out_imag = x_imag * cos_pos + x_real * sin_pos
         
         # Combine real and imaginary parts
         return torch.cat([out_real, out_imag], dim=-1)
@@ -101,16 +96,36 @@ class SimpleDecoderAttention(nn.Module):
         
         batch_size, seq_len, _ = x.shape
         
-        # Default positions if not provided
+        # Very important: make sure we have exactly seq_len=2 for our fixed positions case
+        # If not, we need to pad or truncate the input
+        if seq_len != 2:
+            # Log the unexpected sequence length
+            print(f"Warning: Expected seq_len=2 but got {seq_len}, adjusting to fixed size")
+            
+            if seq_len > 2:
+                # Only use the first 2 positions if input is too long
+                x = x[:, :2, :]
+                seq_len = 2
+            else:
+                # Pad with zeros if input is too short
+                pad = torch.zeros(batch_size, 2-seq_len, x.size(2), dtype=x.dtype, device=x.device)
+                x = torch.cat([x, pad], dim=1)
+                seq_len = 2
+        
+        # Default positions if not provided - ensure we have exactly [0,1]
         if position_ids is None:
             if input_pos is not None:
-                # Use input_pos if provided (compatibility with original interface)
-                position_ids = input_pos
+                # Make sure input_pos has correct shape [batch_size, 2]
+                if input_pos.size(1) != 2:
+                    # Recreate with correct size
+                    position_ids = torch.zeros(batch_size, 2, dtype=torch.long, device=x.device)
+                    position_ids[:, 1] = 1
+                else:
+                    position_ids = input_pos
             else:
-                # For our fixed 2-position case, explicitly create [0, 1] positions
-                position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
-                if seq_len > 1:
-                    position_ids[:, 1:] = 1  # Position 0 for first token, 1 for all others
+                # Explicitly create fixed [0, 1] positions
+                position_ids = torch.zeros(batch_size, 2, dtype=torch.long, device=x.device)
+                position_ids[:, 1] = 1  # Position 0 for first token, 1 for second
         
         # Ensure input is on the correct device and has the right dtype
         device = x.device
