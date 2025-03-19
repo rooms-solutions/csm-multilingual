@@ -392,25 +392,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 decoder_h_flat = decoder_h_flat.to(device=actual_device, dtype=dtype, non_blocking=False)
                 torch.cuda.synchronize(actual_device)
             
-                # Add debug prints to trace device issues if needed
-                if args is not None and getattr(args, 'debug', False) and i == 1 and batch_idx < 2:
-                    debug_info = {
-                        "decoder_h_device": decoder_h.device,
-                        "decoder_h_flat_device": decoder_h_flat.device,
-                        "audio_head_device": audio_head.device
-                    }
-                    logger.debug(f"Debug tensor device info: {debug_info}")
-                
-                # Log shapes and devices for debugging
-                logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
-                logger.debug(f"Before matmul - decoder_h_flat device: {decoder_h_flat.device}, audio_head device: {audio_head.device}")
-                
-                # Add more detailed shape debugging when debug flag is set
-                if args is not None and getattr(args, 'debug', False):
-                    logger.debug(f"decoder_input shape: {decoder_input.shape}")
-                    logger.debug(f"decoder_positions shape: {decoder_positions.shape}")
-                    logger.debug(f"decoder_mask shape: {decoder_mask.shape}")
-                    logger.debug(f"decoder_h shape: {decoder_h.shape}")
+                # Debug logging handled by logger based on log level
             
                 # Now do the final matmul with our safe matrix multiplication function
                 try:
@@ -796,53 +778,7 @@ def train(args):
                 max_scale=2**16     # Lower max scale to avoid overflow
             )
             
-            # Verify AMP compatibility with comprehensive tests
-            logger.info("Running complete AMP compatibility verification")
-            
-            # Test 1: Basic scaling and unscaling
-            dummy_tensor = torch.tensor([1.0], device=device, dtype=torch.float16, requires_grad=True)
-            dummy_optimizer = optim.AdamW([dummy_tensor], lr=0.001)
-            
-            try:
-                with autocast('cuda'):
-                    dummy_loss = dummy_tensor * 2
-                
-                # Test full AMP workflow
-                scaler.scale(dummy_loss).backward()
-                scaler.unscale_(dummy_optimizer)
-                scaler.step(dummy_optimizer)
-                scaler.update()
-                dummy_optimizer.zero_grad()
-                
-                logger.info("✓ AMP basic test passed")
-                
-                # Test 2: More complex tensor operations
-                x = torch.randn(32, 32, device=device, dtype=torch.float16, requires_grad=True)
-                optimizer2 = optim.AdamW([x], lr=0.001)
-                
-                with autocast('cuda'):
-                    y = torch.nn.functional.softmax(x, dim=1)
-                    loss2 = y.mean()
-                
-                scaler.scale(loss2).backward()
-                scaler.unscale_(optimizer2)
-                scaler.step(optimizer2)
-                scaler.update()
-                
-                logger.info("✓ AMP complex operations test passed")
-                
-            except RuntimeError as test_err:
-                # If we encounter BFloat16 specific errors, we'll handle special cases
-                if "BFloat16" in str(test_err) or "not implemented" in str(test_err):
-                    logger.warning(f"AMP compatibility test failed: {test_err}")
-                    logger.warning("Enabling strict compatibility mode with special handling")
-                    args.amp_compatibility_mode = True
-                    # Last attempt with ultra-conservative settings
-                    scaler = GradScaler('cuda', enabled=True, init_scale=1.0)
-                else:
-                    # For other errors, log but continue with AMP
-                    logger.warning(f"AMP test encountered error: {test_err}")
-            
+            # Initialize scaler with conservative settings for stability
             logger.info("AMP initialization complete - using with enhanced stability safeguards")
             
         except Exception as e:
