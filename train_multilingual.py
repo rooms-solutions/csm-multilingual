@@ -10,6 +10,9 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
+# Disable KV cache system - this is crucial for stable training
+os.environ["TORCHTUNE_DISABLE_CACHE"] = "1"
+
 # Fix CUDA multiprocessing issue by setting the start method to 'spawn'
 if __name__ == "__main__":
     # This must happen at the beginning before any other multiprocessing code
@@ -53,7 +56,10 @@ def process_batch(model, text_tokens, audio_tokens, device):
     masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
     h = masked_embeds.sum(dim=2)
     
-    curr_backbone_mask = _index_causal_mask(model.backbone_causal_mask, input_pos)
+    # Create a properly shaped backbone causal mask - this is key to making it work
+    seq_len = text_tokens.size(1)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
     backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
     
     # Get model's dtype and ensure consistent dtype for operations
@@ -101,24 +107,21 @@ def process_batch(model, text_tokens, audio_tokens, device):
         # Always use a consistent batch size for the decoder
         curr_h = curr_h[:b]  # Ensure batch dimension matches original batch
         
-        # Always use fixed positions for decoder - crucial for consistency
-        curr_pos = torch.zeros((b, 2), dtype=torch.long, device=device)
-        curr_pos[:, 1] = 1  # Set second position to 1
+        # Create fixed positions [0, 1] for the decoder - exactly as in cache_test.py
+        decoder_positions = torch.zeros((b, 2), dtype=torch.long, device=device)
+        decoder_positions[:, 1] = 1  # Set second position to 1
         
-        # Create a self-contained causal mask that doesn't depend on model state
-        # The causal mask must be [batch_size, seq_len, seq_len] 
-        curr_decoder_mask = torch.tril(
-            torch.ones(2, 2, dtype=torch.bool, device=device)
-        ).unsqueeze(0).expand(b, 2, 2)
+        # Create a fixed 2x2 causal mask with exact shape [batch_size, 2, 2]
+        decoder_mask = torch.tril(torch.ones(2, 2, dtype=torch.bool, device=device)).unsqueeze(0).expand(b, 2, 2)
         
         # Project to decoder dimension and ensure correct dtype
         decoder_input = model.projection(curr_h).to(dtype=dtype)
         
-        # Pass the manually created mask and position indices
+        # Pass the manually created mask and position indices - identical to cache_test.py approach
         decoder_h = model.decoder(
             decoder_input, 
-            input_pos=curr_pos, 
-            mask=curr_decoder_mask
+            input_pos=decoder_positions, 
+            mask=decoder_mask
         )
         
         # Ensure decoder_h has the correct dtype
@@ -162,21 +165,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
     
     return total_loss
 
-def reinitialize_caches(model, batch_size, device):
-    """Safely reinitialize model caches with consistent dimensions"""
-    try:
-        # First try to reset existing caches
-        model.reset_caches()
-    except:
-        pass
-        
-    try:
-        # Then setup with the requested batch size
-        model.setup_caches(batch_size)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to reinitialize caches: {str(e)}")
-        return False
+# Remove the reinitialize_caches function - we're not using caches at all
 
 def evaluate(model, val_loader, device):
     """Evaluate model on validation data"""
@@ -190,13 +179,12 @@ def evaluate(model, val_loader, device):
             text_tokens = batch["text_tokens"].to(device)
             audio_tokens = batch["audio_tokens"].to(device)
             
-            # Caching is disabled, so no need to do anything here
-            
-            # Process batch
+            # Process batch with the same approach as training
             val_loss = process_batch(model, text_tokens, audio_tokens, device)
             total_val_loss += val_loss.item()
             total_batches += 1
     
+    logger.info(f"Evaluated {total_batches} validation batches")
     return total_val_loss / total_batches if total_batches > 0 else float('inf')
 
 def train(args):
@@ -206,20 +194,24 @@ def train(args):
     # Configure logging level 
     if args.debug:
         logger.setLevel(logging.DEBUG)
+    else:
+        # Always show some debug info during training
+        logger.setLevel(logging.INFO)
+    
+    # Log PyTorch version - helpful for compatibility tracking
+    logger.info(f"Using PyTorch {torch.__version__}")
     
     # Set device
     device = torch.device(args.device)
+    logger.info(f"Using device: {device}")
     
     # Handle cache-related warnings
     import warnings
     warnings.filterwarnings("ignore", message="Key value caches are already setup")
     
-    # Disable the decoder cache completely to avoid dimension issues
-    # This is necessary because the caching system has bugs with varying batch sizes
-    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-        logger.info("Using native PyTorch scaled_dot_product_attention (no KV cache)")
-        # Set environment variable to disable KV caching
-        os.environ["TORCHTUNE_DISABLE_CACHE"] = "1"
+    # Disable the decoder cache completely - crucial for stable training
+    # The environment variable is already set at the module level
+    logger.info("KV caching disabled for training stability")
     
     # Load text tokenizer
     text_tokenizer = load_llama3_tokenizer()
@@ -347,8 +339,9 @@ def train(args):
             
             # Note: audio_waveform is now a list (not tensor) and not needed for training
             
-            # We've completely disabled caching, so no need to set up or reset caches
-            # Just do nothing here - the models will work without caching
+            # With caching disabled, we don't need to set up or reset caches
+            # Leave this empty block for clarity - no cache operations needed
+            pass
             
             # Forward pass and loss calculation
             if args.use_amp:
