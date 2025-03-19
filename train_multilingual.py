@@ -98,17 +98,24 @@ def process_batch(model, text_tokens, audio_tokens, device):
     
     # Process through decoder for subsequent codebooks
     for i in range(1, num_codebooks):
-        # Use the decoder to predict next codebook
-        curr_decoder_mask = _index_causal_mask(model.decoder_causal_mask, curr_pos)
+        # Always use fixed positions [0, 1] for decoder
+        curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
         
-        # Make sure input_pos is properly sized for the decoder
-        # The sequence length should always be 2 (not growing with each iteration)
-        if curr_pos.size(1) != 2:
-            # Reset position indices to just [0, 1] for each batch
-            curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
-            
+        # Create a fresh 2x2 causal mask for every forward pass
+        # This is crucial to avoid dimension mismatches with the cached keys/values
+        curr_decoder_mask = torch.tril(
+            torch.ones(2, 2, dtype=torch.bool, device=device)
+        ).unsqueeze(0).expand(b, 2, 2)
+        
+        # Project to decoder dimension and ensure correct dtype
         decoder_input = model.projection(curr_h).to(dtype=dtype)
-        decoder_h = model.decoder(decoder_input, input_pos=curr_pos, mask=curr_decoder_mask)
+        
+        # Pass the manually created mask to avoid using cached masks with wrong dimensions
+        decoder_h = model.decoder(
+            decoder_input, 
+            input_pos=curr_pos, 
+            mask=curr_decoder_mask
+        )
         
         # Ensure decoder_h has the correct dtype
         decoder_h = decoder_h.to(dtype=dtype)
@@ -317,13 +324,25 @@ def train(args):
             # Reset caches
             model.reset_caches()
             
-            # Properly set up caches with the correct batch size
-            # First set up with the current batch size
-            model.setup_caches(text_tokens.size(0))
-            # Then reset all caches to clear any previous state
-            model.reset_caches()
-            # Debug log to verify cache setup
-            logger.debug(f"Set up caches for batch size: {text_tokens.size(0)}")
+            # Complete cache setup and reset for each batch
+            try:
+                # Only set up caches once per batch
+                if batch_idx == 0 or not hasattr(model, '_cache_initialized'):
+                    # First clear any existing caches
+                    model.reset_caches()
+                    # Set up fresh caches with current batch size
+                    model.setup_caches(text_tokens.size(0))
+                    model._cache_initialized = True
+                else:
+                    # Just reset for subsequent batches
+                    model.reset_caches()
+                    
+                logger.debug(f"Cache initialized for batch {batch_idx+1}, shape: {text_tokens.shape}")
+            except Exception as e:
+                logger.warning(f"Cache setup issue (batch {batch_idx+1}): {str(e)}")
+                # Try recovery by full reinit
+                model.reset_caches()
+                model.setup_caches(text_tokens.size(0))
             
             # Forward pass and loss calculation
             if args.use_amp:

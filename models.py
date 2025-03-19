@@ -111,26 +111,35 @@ class Model(nn.Module):
         self.audio_head = nn.Parameter(torch.empty(args.audio_num_codebooks - 1, decoder_dim, args.audio_vocab_size))
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
-        """Setup KV caches and return a causal mask."""
+        """Setup KV caches with consistent dimensions."""
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
         
-        with device:
+        # First completely clear model caches
+        self.reset_caches()
+        
+        # Set up caches with explicitly controlled dimensions
+        with torch.device(device):
+            # For backbone, use the standard max_seq_len
+            backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
             try:
                 self.backbone.setup_caches(max_batch_size, dtype)
             except RuntimeError as e:
                 if "already setup" not in str(e):
                     raise e
-                    
+                
+            # For decoder, ALWAYS use sequence length of 2 (crucial for avoiding dimension mismatch)
+            # This matches our fixed position indices [0, 1] during training
             try:
-                # For decoder, only use a sequence length of 2 for simplicity
                 self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
             except RuntimeError as e:
                 if "already setup" not in str(e):
                     raise e
 
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
-        self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
+        # Create appropriately sized masks
+        self.register_buffer("backbone_causal_mask", _create_causal_mask(backbone_max_seq_len, device))
+        # Use a small 2x2 causal mask for decoder to match the fixed sequence length
+        self.register_buffer("decoder_causal_mask", _create_causal_mask(2, device))
 
     def generate_frame(
         self,
@@ -167,12 +176,18 @@ class Model(nn.Module):
 
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
-        curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
+        
+        # Always use positions [0, 1] to match training approach
+        curr_pos = torch.tensor([[0, 1]], device=curr_h.device).expand(curr_h.size(0), 2)
 
         # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
         for i in range(1, self.args.audio_num_codebooks):
-            curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
+            # Create a fresh 2x2 causal mask for each iteration
+            curr_decoder_mask = torch.tril(
+                torch.ones(2, 2, dtype=torch.bool, device=curr_h.device)
+            ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
+            
             decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
                 dtype=dtype
             )
@@ -182,7 +197,8 @@ class Model(nn.Module):
 
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            curr_pos = curr_pos[:, -1:] + 1
+            # Keep using positions [0, 1] 
+            curr_pos = torch.tensor([[0, 1]], device=curr_h.device).expand(curr_h.size(0), 2)
 
         return curr_sample
 
