@@ -352,7 +352,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
 
 # Remove the reinitialize_caches function - we're not using caches at all
 
-def evaluate(model, val_loader, device):
+def evaluate(model, val_loader, device, args=None):
     """Evaluate model on validation data"""
     model.eval()
     total_val_loss = 0
@@ -587,7 +587,7 @@ def train(args):
         
         # Validation
         if val_loader is not None:
-            val_loss = evaluate(model, val_loader, device)
+            val_loss = evaluate(model, val_loader, device, args)
             logger.info(f"Validation loss: {val_loss:.4f}")
             
             # Early stopping check
