@@ -107,11 +107,14 @@ def process_batch(model, text_tokens, audio_tokens, device):
             # Add position embedding to create context for this codebook position
             codebook_h = last_h.squeeze(1) + position_embeddings[pos_idx]
             
-            # Get logits by matmul with the audio head
+            # Project backbone dimension (2048) to decoder dimension (1024) before matmul
+            projected_h = model.projection(codebook_h.unsqueeze(1)).to(dtype=dtype)
+            
+            # Get logits by matmul with the audio head - transpose the audio_head for correct multiplication
             ci_logits = torch.matmul(
-                codebook_h.unsqueeze(1), 
-                model.audio_head[i-1].to(dtype=dtype)
-            ).squeeze(1)
+                projected_h.squeeze(1),  # Shape: [batch_size, decoder_dim]
+                model.audio_head[i-1].to(dtype=dtype)  # Shape: [decoder_dim, vocab_size]
+            )  # Result: [batch_size, vocab_size]
             
             # Extract target
             if audio_tokens.dim() == 3:
@@ -139,11 +142,13 @@ def process_batch(model, text_tokens, audio_tokens, device):
             # Ensure decoder_h has the correct dtype
             decoder_h = decoder_h.to(dtype=dtype)
             
-            # Get logits with proper dtype consistency
+            # Get logits with proper dtype consistency - ensure correct dimensions
+            # Use .squeeze() first to get shape [batch_size, decoder_dim] before matrix multiply
+            decoder_h_flat = decoder_h[:, -1, :].to(dtype=dtype)  # Shape: [batch_size, decoder_dim]
             ci_logits = torch.matmul(
-                decoder_h[:, -1, :].unsqueeze(1), 
-                model.audio_head[i-1].to(dtype=dtype)
-            ).squeeze(1)
+                decoder_h_flat,  # Shape: [batch_size, decoder_dim]
+                model.audio_head[i-1].to(dtype=dtype)  # Shape: [decoder_dim, vocab_size]
+            )  # Result: [batch_size, vocab_size]
             
             # Extract target as 1D tensor - always clone to avoid in-place issues
             if audio_tokens.dim() == 3:
