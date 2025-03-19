@@ -177,8 +177,10 @@ class Model(nn.Module):
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
         
-        # Always use positions [0, 1] to match training approach
-        curr_pos = torch.tensor([[0, 1]], device=curr_h.device).expand(curr_h.size(0), 2)
+        # Create positions [0, 1] directly with the right batch dimension
+        # This avoids inconsistencies with expand/repeat operations
+        curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=curr_h.device)
+        curr_pos[:, 1] = 1  # Set second position to 1
 
         # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
@@ -197,8 +199,9 @@ class Model(nn.Module):
 
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            # Keep using positions [0, 1] 
-            curr_pos = torch.tensor([[0, 1]], device=curr_h.device).expand(curr_h.size(0), 2)
+            # Create a fresh position tensor with consistent dimensions
+            curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=curr_h.device)
+            curr_pos[:, 1] = 1  # Set second position to 1
 
         return curr_sample
 
