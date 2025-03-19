@@ -429,6 +429,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
             total_loss += ci_loss
             
+            # Store individual loss for logging
+            if not hasattr(process_batch, 'individual_losses'):
+                process_batch.individual_losses = []
+            process_batch.individual_losses.append(ci_loss.item())
+            
             # For next iteration, if not the last codebook
             if i < num_codebooks - 1:
                 # Get embedding for the next codebook token with careful device handling
@@ -438,10 +443,10 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                         token_input = audio_tokens[:, i, 0].clone().view(-1, 1).to(device=device)
                     else:
                         token_input = audio_tokens[:, i].clone().view(-1, 1).to(device=device)
-                    
+                
                     # Get embedding with device-prepared inputs
                     ci_embed = model._embed_audio(i, token_input)
-                    
+                
                     # Double-check the embedding device
                     if ci_embed.device != device:
                         ci_embed = ci_embed.to(device=device, dtype=dtype)
@@ -453,17 +458,24 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                         decoder_h.size(0), 1, embed_dim, 
                         device=device, dtype=dtype
                     )
-                
+            
                 # Fix dimensions - ensure consistent shape
                 if ci_embed.dim() == 4:
                     ci_embed = ci_embed.squeeze(2)
-                    
+                
                 # Use a fresh position tensor each time, always keeping it at size [b, 2]
                 # This ensures we always have position indices [0, 1] for each batch
                 curr_h = ci_embed
                 curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
-        
-        return total_loss
+    
+        # Normalize the loss by dividing by the number of codebooks
+        normalized_loss = total_loss / num_codebooks
+    
+        # Log individual losses occasionally to help debug
+        if batch_idx % 100 == 0:
+            logger.info(f"Avg codebook loss: {normalized_loss.item():.4f}, raw sum: {total_loss.item():.4f}")
+    
+        return normalized_loss  # Return normalized loss instead of total
     except Exception as e:
         # Handle any errors with a simplified fallback
         logger.error(f"Error in process_batch: {e}")
