@@ -11,6 +11,5 @@ tqdm==4.66.1
 matplotlib==3.7.3
 pyyaml==6.0.1
 wandb==0.16.4
-# The problematic packages below need to be installed separately
-# moshi==0.2.2
-# silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
+moshi==0.2.2
+silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
