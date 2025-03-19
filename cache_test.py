@@ -113,8 +113,10 @@ def test_single_batch(language="de", batch_size=4, data_dir="./data"):
     h = masked_embeds.sum(dim=2)
     print(f"Hidden state shape: {h.shape}")
     
-    # Create backbone mask
-    curr_backbone_mask = model.backbone_causal_mask[input_pos]
+    # Create a properly shaped backbone causal mask
+    seq_len = text_tokens.size(1)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)  # [batch_size, seq_len, seq_len]
     print(f"Backbone mask shape: {curr_backbone_mask.shape}")
     
     # Forward pass through backbone
