@@ -551,6 +551,10 @@ def evaluate(model, val_loader, device, args=None):
             total_val_loss += val_loss.item()
             total_batches += 1
     
+            # Reset individual losses between batches for clean logging
+            if hasattr(process_batch, 'individual_losses'):
+                process_batch.individual_losses = []
+    
     logger.info(f"Evaluated {total_batches} validation batches")
     return total_val_loss / total_batches if total_batches > 0 else float('inf')
 
