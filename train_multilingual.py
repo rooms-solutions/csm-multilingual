@@ -46,146 +46,145 @@ def process_batch(model, text_tokens, audio_tokens, device):
     
     # Set up robust error handling
     try:
+        # Create input format - use clone() to avoid in-place modifications
+        b, s = text_tokens.size()
+        text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
+        text_frame[:, :, -1] = text_tokens.clone()
+        text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
+        text_frame_mask[:, :, -1] = True
     
-    # Create input format - use clone() to avoid in-place modifications
-    b, s = text_tokens.size()
-    text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
-    text_frame[:, :, -1] = text_tokens.clone()
-    text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
-    text_frame_mask[:, :, -1] = True
-    
-    # Get input positions - avoid in-place repeat
-    input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
-    
-    # Forward pass through backbone
-    embeds = model._embed_tokens(text_frame)
-    masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
-    h = masked_embeds.sum(dim=2)
-    
-    # Create a properly shaped backbone causal mask - this is key to making it work
-    seq_len = text_tokens.size(1)
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-    curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
-    backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
-    
-    # Get model's dtype and ensure consistent dtype for operations
-    dtype = next(model.parameters()).dtype
-    backbone_output = backbone_output.to(dtype=dtype)
-    
-    # Last hidden state for each sequence
-    last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
-    
-    # Codebook predictions and loss calculation
-    num_codebooks = audio_tokens.size(1)
-    total_loss = 0
-    
-    # First codebook prediction using the backbone output
-    c0_logits = model.codebook0_head(last_h.squeeze(1).to(dtype=dtype))
-    
-    # Extract target as 1D tensor
-    if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
-        c0_targets = audio_tokens[:, 0, 0].clone()  # Get first token of first codebook
-    else:  # If shape is [batch_size, num_codebooks]
-        c0_targets = audio_tokens[:, 0].clone()  # Get first codebook
-    
-    # Make sure targets are 1D
-    c0_targets = c0_targets.view(-1)
-    c0_loss = nn.functional.cross_entropy(c0_logits, c0_targets)
-    total_loss += c0_loss
-    
-    # Teacher forcing for remaining codebooks
-    if audio_tokens.dim() == 3:
-        audio_embed = model._embed_audio(0, audio_tokens[:, 0, 0].clone().view(-1, 1))
-    else:
-        audio_embed = model._embed_audio(0, audio_tokens[:, 0].clone().view(-1, 1))
-    
-    # Fix dimensions - ensure audio_embed matches last_h dimensions
-    if audio_embed.dim() == 4:  # If shape is [B, 1, 1, H]
-        audio_embed = audio_embed.squeeze(2)  # Remove the extra dimension
+        # Get input positions - avoid in-place repeat
+        input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
         
-    # Concatenate along sequence dimension - create new tensor
-    curr_h = torch.cat([last_h, audio_embed], dim=1)
-    # Create new position tensor without repeat (use expand)
-    curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
+        # Forward pass through backbone
+        embeds = model._embed_tokens(text_frame)
+        masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
+        h = masked_embeds.sum(dim=2)
     
-    # Process through decoder for subsequent codebooks
-    for i in range(1, num_codebooks):
-        # Always use a consistent batch size for the decoder
-        curr_h = curr_h[:b]  # Ensure batch dimension matches original batch
+        # Create a properly shaped backbone causal mask - this is key to making it work
+        seq_len = text_tokens.size(1)
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
+        backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
         
-        # Create a simplified approach that doesn't rely on positional embeddings
-        # Project to decoder dimension and ensure correct dtype
-        decoder_input = model.projection(curr_h).to(dtype=dtype)
-            
-        # We'll bypass the positional embeddings by using a simple approach:
-        # Just use the decoder layers directly without positional encoding
-        # This should avoid the tensor dimension issues
-        decoder_h = None
-        try:
-            # First try with a dummy mask and no positional embeddings
-            dummy_mask = torch.ones((b, 2, 2), dtype=torch.bool, device=device)
-            decoder_h = model.decoder(
-                decoder_input,
-                mask=dummy_mask,
-                # Skip positional embeddings completely
-                input_pos=None
-            )
-        except Exception as e:
-            logger.warning(f"First decoder attempt failed: {str(e)}")
-            try:
-                # Fall back to direct layer processing if needed
-                decoder_h = decoder_input
-                for layer in model.decoder.layers:
-                    # Process through FF layer directly
-                    decoder_h = layer.ff(decoder_h)
-            except Exception as e:
-                logger.error(f"Decoder fallback failed: {str(e)}")
-                # Last resort - use a simple projection as replacement
-                decoder_h = decoder_input
-            
-        # Make sure we have output even if all methods failed
-        if decoder_h is None:
-            decoder_h = decoder_input
+        # Get model's dtype and ensure consistent dtype for operations
+        dtype = next(model.parameters()).dtype
+        backbone_output = backbone_output.to(dtype=dtype)
         
-        # Ensure decoder_h has the correct dtype
-        decoder_h = decoder_h.to(dtype=dtype)
+        # Last hidden state for each sequence
+        last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
         
-        # Get logits with proper dtype consistency
-        ci_logits = torch.matmul(
-            decoder_h[:, -1, :].unsqueeze(1), 
-            model.audio_head[i-1].to(dtype=dtype)
-        ).squeeze(1)
+        # Codebook predictions and loss calculation
+        num_codebooks = audio_tokens.size(1)
+        total_loss = 0
+    
+        # First codebook prediction using the backbone output
+        c0_logits = model.codebook0_head(last_h.squeeze(1).to(dtype=dtype))
         
-        # Extract target as 1D tensor - always clone to avoid in-place issues
-        if audio_tokens.dim() == 3:
-            ci_targets = audio_tokens[:, i, 0].clone()
-        else:
-            ci_targets = audio_tokens[:, i].clone()
-            
+        # Extract target as 1D tensor
+        if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
+            c0_targets = audio_tokens[:, 0, 0].clone()  # Get first token of first codebook
+        else:  # If shape is [batch_size, num_codebooks]
+            c0_targets = audio_tokens[:, 0].clone()  # Get first codebook
+    
         # Make sure targets are 1D
-        ci_targets = ci_targets.view(-1)
+        c0_targets = c0_targets.view(-1)
+        c0_loss = nn.functional.cross_entropy(c0_logits, c0_targets)
+        total_loss += c0_loss
         
-        # Calculate loss
-        ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
-        total_loss += ci_loss
-        
-        # For next iteration, if not the last codebook
-        if i < num_codebooks - 1:
-            # Get embedding for the next codebook token - always clone inputs
-            if audio_tokens.dim() == 3:
-                ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].clone().view(-1, 1))
-            else:
-                ci_embed = model._embed_audio(i, audio_tokens[:, i].clone().view(-1, 1))
-            
-            # Fix dimensions - ensure consistent shape
-            if ci_embed.dim() == 4:
-                ci_embed = ci_embed.squeeze(2)
-                
-            # Use a fresh position tensor each time, always keeping it at size [b, 2]
-            # This ensures we always have position indices [0, 1] for each batch
-            curr_h = ci_embed
-            curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
+        # Teacher forcing for remaining codebooks
+        if audio_tokens.dim() == 3:
+            audio_embed = model._embed_audio(0, audio_tokens[:, 0, 0].clone().view(-1, 1))
+        else:
+            audio_embed = model._embed_audio(0, audio_tokens[:, 0].clone().view(-1, 1))
     
+        # Fix dimensions - ensure audio_embed matches last_h dimensions
+        if audio_embed.dim() == 4:  # If shape is [B, 1, 1, H]
+            audio_embed = audio_embed.squeeze(2)  # Remove the extra dimension
+            
+        # Concatenate along sequence dimension - create new tensor
+        curr_h = torch.cat([last_h, audio_embed], dim=1)
+        # Create new position tensor without repeat (use expand)
+        curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
+        
+        # Process through decoder for subsequent codebooks
+        for i in range(1, num_codebooks):
+            # Always use a consistent batch size for the decoder
+            curr_h = curr_h[:b]  # Ensure batch dimension matches original batch
+            
+            # Create a simplified approach that doesn't rely on positional embeddings
+            # Project to decoder dimension and ensure correct dtype
+            decoder_input = model.projection(curr_h).to(dtype=dtype)
+                
+            # We'll bypass the positional embeddings by using a simple approach:
+            # Just use the decoder layers directly without positional encoding
+            # This should avoid the tensor dimension issues
+            decoder_h = None
+            try:
+                # First try with a dummy mask and no positional embeddings
+                dummy_mask = torch.ones((b, 2, 2), dtype=torch.bool, device=device)
+                decoder_h = model.decoder(
+                    decoder_input,
+                    mask=dummy_mask,
+                    # Skip positional embeddings completely
+                    input_pos=None
+                )
+            except Exception as e:
+                logger.warning(f"First decoder attempt failed: {str(e)}")
+                try:
+                    # Fall back to direct layer processing if needed
+                    decoder_h = decoder_input
+                    for layer in model.decoder.layers:
+                        # Process through FF layer directly
+                        decoder_h = layer.ff(decoder_h)
+                except Exception as e:
+                    logger.error(f"Decoder fallback failed: {str(e)}")
+                    # Last resort - use a simple projection as replacement
+                    decoder_h = decoder_input
+                
+            # Make sure we have output even if all methods failed
+            if decoder_h is None:
+                decoder_h = decoder_input
+        
+            # Ensure decoder_h has the correct dtype
+            decoder_h = decoder_h.to(dtype=dtype)
+            
+            # Get logits with proper dtype consistency
+            ci_logits = torch.matmul(
+                decoder_h[:, -1, :].unsqueeze(1), 
+                model.audio_head[i-1].to(dtype=dtype)
+            ).squeeze(1)
+            
+            # Extract target as 1D tensor - always clone to avoid in-place issues
+            if audio_tokens.dim() == 3:
+                ci_targets = audio_tokens[:, i, 0].clone()
+            else:
+                ci_targets = audio_tokens[:, i].clone()
+                
+            # Make sure targets are 1D
+            ci_targets = ci_targets.view(-1)
+            
+            # Calculate loss
+            ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
+            total_loss += ci_loss
+            
+            # For next iteration, if not the last codebook
+            if i < num_codebooks - 1:
+                # Get embedding for the next codebook token - always clone inputs
+                if audio_tokens.dim() == 3:
+                    ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].clone().view(-1, 1))
+                else:
+                    ci_embed = model._embed_audio(i, audio_tokens[:, i].clone().view(-1, 1))
+                
+                # Fix dimensions - ensure consistent shape
+                if ci_embed.dim() == 4:
+                    ci_embed = ci_embed.squeeze(2)
+                    
+                # Use a fresh position tensor each time, always keeping it at size [b, 2]
+                # This ensures we always have position indices [0, 1] for each batch
+                curr_h = ci_embed
+                curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
+        
         return total_loss
     except RuntimeError as e:
         # Detect dimension mismatch errors and provide more information
