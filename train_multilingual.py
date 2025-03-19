@@ -649,6 +649,9 @@ def train(args):
         actual_dtype = next(model.parameters()).dtype
         logger.info(f"Model parameters dtype: {actual_dtype}")
         
+        # Make sure model is in training mode
+        model.train()
+        
         # Force all modules to have consistent dtypes
         for module in model.modules():
             for param_name, param in module.named_parameters(recurse=False):
