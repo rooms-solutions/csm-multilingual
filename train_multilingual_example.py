@@ -134,6 +134,13 @@ def train_language(args, language):
     if args.use_amp:
         cmd.append("--use_amp")
     
+    # Add gradient accumulation and num_workers if specified
+    if args.gradient_accumulation_steps > 1:
+        cmd.extend(["--gradient_accumulation_steps", str(args.gradient_accumulation_steps)])
+    
+    if args.num_workers != 4:  # Only add if different from default
+        cmd.extend(["--num_workers", str(args.num_workers)])
+    
     logger.info(f"Running command: {' '.join(cmd)}")
     
     # Run subprocess with output going directly to console
@@ -176,6 +183,10 @@ def main():
                         help="Learning rate")
     parser.add_argument("--num_epochs", type=int, default=10,
                         help="Number of training epochs")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of updates steps to accumulate before backward pass")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Number of dataloader workers")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device (cuda or cpu)")
     parser.add_argument("--use_amp", action="store_true",
