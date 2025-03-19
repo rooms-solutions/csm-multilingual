@@ -129,8 +129,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
             total_loss += ci_loss
             
             # Use the decoder properly with consistent dimensions
-            # Project to decoder dimension and ensure correct dtype
-            decoder_input = model.projection(codebook_h.unsqueeze(1)).to(dtype=dtype)
+            # Project to decoder dimension and ensure correct dtype and device
+            decoder_input = model.projection(codebook_h.unsqueeze(1)).to(device=device, dtype=dtype)
             
             # Create fixed positions tensors with proper shape
             decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
@@ -143,8 +143,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
             ).unsqueeze(0).expand(b, 2, 2)
             
             # Now use the proper decoder with our fixed attention implementation
-            # Pass mask as a keyword argument to avoid conflicts
-            decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(dtype=dtype)
+            # Pass mask as a keyword argument to avoid conflicts and ensure device consistency
+            decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(device=device, dtype=dtype)
             
             # Log what we're doing
             if i == 1:  # Only log once per batch
@@ -167,8 +167,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 # Process through the simplified decoder for this position
                 decoder_output = model.simplified_decoders[i-1](decoder_features)
                 
-                # Use the output directly for the logits calculation
-                ci_logits = torch.matmul(decoder_output, model.audio_head[i-1].to(dtype=dtype))
+                # Use the output directly for the logits calculation - ensure same device
+                ci_logits = torch.matmul(decoder_output, model.audio_head[i-1].to(device=device, dtype=dtype))
                 
             else:
                 # Fallback to original approach if simplified decoders not available
@@ -183,8 +183,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
                     # Unusual case - reshape to expected dimensions
                     decoder_h_flat = decoder_h.view(b, -1, decoder_h.size(-1))[:, -1, :].to(dtype=dtype)
                 
-                # Ensure audio_head has correct shape for matrix multiplication
-                audio_head = model.audio_head[i-1].to(dtype=dtype)
+                # Ensure audio_head has correct shape and device for matrix multiplication
+                audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
                 
                 # Log shapes for debugging
                 logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
@@ -207,11 +207,13 @@ def process_batch(model, text_tokens, audio_tokens, device):
             
             # For next iteration, if not the last codebook
             if i < num_codebooks - 1:
-                # Get embedding for the next codebook token - always clone inputs
+                # Get embedding for the next codebook token - always clone inputs and ensure correct device
                 if audio_tokens.dim() == 3:
                     ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].clone().view(-1, 1))
                 else:
                     ci_embed = model._embed_audio(i, audio_tokens[:, i].clone().view(-1, 1))
+                # Ensure the embedding is on the correct device
+                ci_embed = ci_embed.to(device=device, dtype=dtype)
                 
                 # Fix dimensions - ensure consistent shape
                 if ci_embed.dim() == 4:
