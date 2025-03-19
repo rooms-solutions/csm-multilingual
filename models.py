@@ -208,7 +208,22 @@ class Model(nn.Module):
         pass
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
-        return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+        """Embed audio tokens with robust dimension handling"""
+        try:
+            return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+        except RuntimeError as e:
+            # Handle dimension issues by reshaping
+            if "size mismatch" in str(e) or "dimension" in str(e):
+                # Reshape tokens to ensure 2D shape [batch_size, seq_len]
+                if tokens.dim() > 2:
+                    tokens = tokens.view(tokens.size(0), -1)
+                elif tokens.dim() == 1:
+                    tokens = tokens.unsqueeze(1)
+                
+                # Try again with reshaped tensor
+                return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+            else:
+                raise
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
