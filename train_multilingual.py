@@ -63,9 +63,9 @@ logger = logging.getLogger("train_multilingual")
 
 def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx=0):
     """Process a single batch and calculate the loss with a simplified approach"""
-    # Debug prints to verify input shapes and types
-    print(f"Debug - text_tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
-    print(f"Debug - model dtype: {next(model.parameters()).dtype}")
+    # Debug info using logger instead of print
+    logger.debug(f"Text tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
+    logger.debug(f"Model dtype: {next(model.parameters()).dtype}")
     
     # Set up robust error handling
     try:
