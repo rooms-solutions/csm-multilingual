@@ -128,7 +128,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
             
             # Skip the decoder and use a simplified approach with direct projection
             # Project to decoder dimension and ensure correct dtype
-            decoder_input = model.projection(curr_h).to(dtype=dtype)
+            decoder_input = model.projection(codebook_h.unsqueeze(1)).to(dtype=dtype)
             
             # Don't use the decoder at all - just use the decoder input as the output
             # This is a workaround for the dimension issues
