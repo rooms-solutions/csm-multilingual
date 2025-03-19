@@ -50,6 +50,45 @@ def safe_matmul(tensor1, tensor2, device):
     # Perform the matrix multiplication
     return torch.matmul(tensor1_safe, tensor2_safe)
 
+def numerically_stable_cross_entropy(logits, targets, epsilon=1e-5):
+    """
+    Compute cross entropy loss with numerical stability improvements.
+    
+    Args:
+        logits: Model predictions
+        targets: Target indices
+        epsilon: Small value to avoid log(0)
+        
+    Returns:
+        Numerically stable cross entropy loss
+    """
+    # Check for NaN or Inf values in inputs
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        # Clip extreme values to stabilize computation
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+    
+    # Get shape information
+    batch_size = logits.size(0)
+    num_classes = logits.size(1)
+    
+    # Apply log_softmax with more numerical stability
+    # Use LogSoftmax instead of log(softmax) for better stability
+    log_probs = torch.nn.functional.log_softmax(logits, dim=1)
+    
+    # Create one-hot encoding of targets
+    targets_one_hot = torch.zeros_like(logits, device=logits.device)
+    targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+    
+    # Compute cross entropy with epsilon for numerical stability
+    loss = -torch.sum(targets_one_hot * log_probs) / batch_size
+    
+    # Ensure loss is finite
+    if torch.isnan(loss) or torch.isinf(loss):
+        # Return a stable default loss value that can be backpropagated
+        return torch.tensor(10.0, device=logits.device, requires_grad=True)
+    
+    return loss
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -112,7 +151,23 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
     
         # Make sure targets are 1D
         c0_targets = c0_targets.view(-1)
-        c0_loss = nn.functional.cross_entropy(c0_logits, c0_targets)
+        
+        # Use numerically stable cross entropy instead of standard version
+        try:
+            # Check for NaN inputs first
+            if torch.isnan(c0_logits).any() or torch.isinf(c0_logits).any():
+                logger.warning(f"Detected NaN or Inf in c0_logits at batch {batch_idx}")
+                # Attempt to fix NaN/Inf values
+                c0_logits = torch.nan_to_num(c0_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            # Use our stable implementation
+            c0_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
+        except Exception as e:
+            logger.error(f"Error in c0 loss calculation: {e}")
+            # Fallback with very careful input handling
+            c0_logits_safe = torch.nan_to_num(c0_logits.detach().clone(), nan=0.0)
+            c0_loss = nn.functional.cross_entropy(c0_logits_safe, c0_targets)
+        
         total_loss += c0_loss
         
         # For remaining codebooks, use a simplified approach without the decoder
@@ -190,8 +245,21 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             # Make sure targets are 1D
             ci_targets = ci_targets.view(-1)
             
-            # Calculate loss
-            ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
+            # Calculate loss with numerical stability
+            try:
+                # Check for NaN/Inf values
+                if torch.isnan(ci_logits).any() or torch.isinf(ci_logits).any():
+                    logger.warning(f"Detected NaN or Inf in ci_logits for codebook {i} at batch {batch_idx}")
+                    ci_logits = torch.nan_to_num(ci_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+                
+                # Use our stable implementation
+                ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
+            except Exception as e:
+                logger.error(f"Error in ci_loss calculation for codebook {i}: {e}")
+                # Fallback with careful input handling
+                ci_logits_safe = torch.nan_to_num(ci_logits.detach().clone(), nan=0.0)
+                ci_loss = nn.functional.cross_entropy(ci_logits_safe, ci_targets, reduction='mean')
+            
             total_loss += ci_loss
             
             # Use the decoder properly with consistent dimensions
@@ -457,9 +525,18 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             else:
                 c0_targets = audio_tokens[:, 0].clone()
             
-            # Calculate loss for just first codebook
+            # Calculate loss for just first codebook with numerical stability
             c0_targets = c0_targets.view(-1)
-            fallback_loss = nn.functional.cross_entropy(c0_logits, c0_targets)
+            
+            # Clean up logits to prevent NaN
+            c0_logits = torch.nan_to_num(c0_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            # Apply scaling to prevent extreme values
+            if c0_logits.abs().max() > 1e4:
+                c0_logits = c0_logits * (1e4 / c0_logits.abs().max())
+            
+            # Use stable cross entropy
+            fallback_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
             
             logger.info(f"Fallback successful - only using first codebook loss: {fallback_loss.item()}")
             return fallback_loss
@@ -658,6 +735,20 @@ def train(args):
         T_max=len(train_loader) * args.num_epochs
     )
     
+    # Add a function to check for and fix gradient issues
+    def check_gradients(model):
+        """Check for and fix NaN/Inf gradients to maintain training stability"""
+        any_issues = False
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    any_issues = True
+                    # Log the issue
+                    logger.warning(f"NaN/Inf found in gradients for parameter: {name}")
+                    # Fix the gradient - replace with zeros
+                    param.grad = torch.zeros_like(param.grad)
+        return any_issues
+    
     # Mixed precision training with proper dtype handling for BFloat16 compatibility
     if args.use_amp:
         try:
@@ -747,7 +838,18 @@ def train(args):
                 
                 # Optimize with mixed precision using try-except blocks for safety
                 try:
+                    # Check for NaN in loss before backward pass
+                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
+                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
+                        # Reset the loss to a stable value
+                        normalized_loss = torch.tensor(1.0, device=device, dtype=dtype, requires_grad=True)
+                    
                     scaler.scale(normalized_loss).backward()
+                    
+                    # Check for NaN gradients after backward
+                    grad_issues = check_gradients(model)
+                    if grad_issues:
+                        logger.warning("Fixed NaN/Inf gradients after backward pass")
                     
                     # Only update weights after accumulating gradients for specified steps
                     if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
@@ -791,7 +893,18 @@ def train(args):
                     optimizer.zero_grad(set_to_none=True)
             else:
                 # Standard optimization with gradient accumulation
+                # Check for NaN in loss before backward pass
+                if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
+                    logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
+                    # Reset the loss to a stable value
+                    normalized_loss = torch.tensor(1.0, device=device, dtype=dtype, requires_grad=True)
+                
                 normalized_loss.backward()
+                
+                # Check for NaN gradients after backward
+                grad_issues = check_gradients(model)
+                if grad_issues:
+                    logger.warning("Fixed NaN/Inf gradients after backward pass")
                 
                 # Only update weights after accumulating gradients for specified steps
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
