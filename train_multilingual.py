@@ -1014,13 +1014,15 @@ def train(args):
                                         logger.error(f"Error in optimizer step: {step_err}")
                                         # Last resort: update optimizer directly
                                         optimizer.step()
+                                        scheduler.step()  # Make sure to update scheduler after optimizer
                                 else:
                                     # For non-BFloat16 errors, log but still try to continue
                                     logger.error(f"Unexpected error in unscale: {unscale_err}")
                                     optimizer.step()  # Try regular step as fallback
+                                    scheduler.step()  # Make sure to update scheduler after optimizer
                         
                         optimizer.zero_grad(set_to_none=True)  # More efficient
-                        scheduler.step()
+                        # scheduler.step() moved to after optimizer.step() in all paths
                 except Exception as e:
                     logger.error(f"Error in backward pass: {e}")
                     optimizer.zero_grad(set_to_none=True)
@@ -1044,8 +1046,8 @@ def train(args):
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     optimizer.step()
+                    scheduler.step()  # Immediately after optimizer.step()
                     optimizer.zero_grad(set_to_none=True)  # More efficient
-                    scheduler.step()
                 
             # Force synchronization after parameter updates
             if torch.cuda.is_available() and ((batch_idx + 1) % args.gradient_accumulation_steps == 0):
