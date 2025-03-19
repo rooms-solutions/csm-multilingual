@@ -600,13 +600,15 @@ def train(args):
         max_audio_length=args.max_audio_length,
     )
     
-    # Create train dataloader with safer settings for CUDA
+    # Create train dataloader with optimized settings
+    num_workers = 2 if args.device == "cuda" else args.num_workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA to avoid forking issues
-        pin_memory=False,  # Disable pin_memory to avoid CUDA tensor pinning issues
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
         drop_last=True,
         collate_fn=multilingual_collate_fn  # Use our custom collate function
     )
@@ -626,8 +628,9 @@ def train(args):
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=args.num_workers if args.device == "cpu" else 0,  # Use 0 workers with CUDA
-            pin_memory=False,  # Disable pin_memory to avoid CUDA tensor pinning issues
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
             collate_fn=multilingual_collate_fn  # Use our custom collate function
         )
     
@@ -664,6 +667,9 @@ def train(args):
     global_step = 0
     logger.info(f"Starting training for language: {args.language}")
     
+    # Initialize gradients to zero before starting
+    optimizer.zero_grad(set_to_none=True)
+    
     for epoch in range(args.num_epochs):
         model.train()
         epoch_loss = 0.0
@@ -680,40 +686,52 @@ def train(args):
             # Leave this empty block for clarity - no cache operations needed
             pass
             
-            # Forward pass and loss calculation
+            # Normalize loss for gradient accumulation
+            normalized_loss = total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
+            normalized_loss = normalized_loss / args.gradient_accumulation_steps
+            
+            # Forward pass and loss calculation with gradient accumulation
             if args.use_amp:
                 with autocast():
-                    total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
-                    
-                # Optimize with mixed precision
-                optimizer.zero_grad(set_to_none=True)  # More efficient
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
-                    
-                # Standard optimization
-                optimizer.zero_grad(set_to_none=True)  # More efficient
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                    # Use the already computed loss
+                    pass
                 
-            # Force synchronization after each step
-            if torch.cuda.is_available():
+                # Optimize with mixed precision
+                scaler.scale(normalized_loss).backward()
+                
+                # Only update weights after accumulating gradients for specified steps
+                if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)  # More efficient
+                    scheduler.step()
+            else:
+                # Standard optimization with gradient accumulation
+                normalized_loss.backward()
+                
+                # Only update weights after accumulating gradients for specified steps
+                if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)  # More efficient
+                    scheduler.step()
+                
+            # Force synchronization after parameter updates
+            if torch.cuda.is_available() and ((batch_idx + 1) % args.gradient_accumulation_steps == 0):
                 torch.cuda.synchronize(device)
-            
-            scheduler.step()
             epoch_loss += total_loss.item()
             
             # Update progress bar
             progress_bar.set_postfix(loss=total_loss.item())
             
+            # Only count a complete step after gradient accumulation
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
+                global_step += 1
+            
             # Save checkpoint periodically
-            global_step += 1
-            if global_step % args.save_steps == 0:
+            if global_step > 0 and global_step % args.save_steps == 0:
                 checkpoint_path = os.path.join(output_dir, f"checkpoint-{global_step}.pt")
                 torch.save(model.state_dict(), checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
@@ -799,6 +817,8 @@ def main():
                         help="Enable debug logging")
     parser.add_argument("--disable_custom_decoder", action="store_true",
                         help="Disable custom decoder implementation (not recommended)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of updates steps to accumulate before backward pass")
     
     args = parser.parse_args()
     
