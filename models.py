@@ -114,9 +114,6 @@ class Model(nn.Module):
         """Setup KV caches and return a causal mask."""
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
-
-        # Reset caches first to ensure clean setup
-        self.reset_caches()
         
         with device:
             try:
@@ -190,8 +187,22 @@ class Model(nn.Module):
         return curr_sample
 
     def reset_caches(self):
-        self.backbone.reset_caches()
-        self.decoder.reset_caches()
+        """Reset caches if they're already setup"""
+        try:
+            if hasattr(self.backbone, 'caches_are_enabled') and self.backbone.caches_are_enabled():
+                self.backbone.reset_caches()
+        except RuntimeError as e:
+            # Ignore errors about caches not being setup
+            if "not setup" not in str(e):
+                raise e
+                
+        try:
+            if hasattr(self.decoder, 'caches_are_enabled') and self.decoder.caches_are_enabled():
+                self.decoder.reset_caches()
+        except RuntimeError as e:
+            # Ignore errors about caches not being setup
+            if "not setup" not in str(e):
+                raise e
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
         return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)

@@ -163,9 +163,9 @@ def evaluate(model, val_loader, device):
             text_tokens = batch["text_tokens"].to(device)
             audio_tokens = batch["audio_tokens"].to(device)
             
-            # Reset and setup caches
-            model.reset_caches()
+            # Setup caches first, then reset them
             model.setup_caches(text_tokens.size(0))
+            model.reset_caches()
             
             # Process batch
             val_loss = process_batch(model, text_tokens, audio_tokens, device)
@@ -318,10 +318,10 @@ def train(args):
             model.reset_caches()
             
             # Properly set up caches with the correct batch size
-            # First reset all caches completely
-            model.reset_caches()
-            # Then set up with the current batch size
+            # First set up with the current batch size
             model.setup_caches(text_tokens.size(0))
+            # Then reset all caches to clear any previous state
+            model.reset_caches()
             # Debug log to verify cache setup
             logger.debug(f"Set up caches for batch size: {text_tokens.size(0)}")
             
