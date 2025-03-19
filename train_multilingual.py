@@ -7,7 +7,7 @@ import json
 import logging
 import multiprocessing
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # Disable KV cache system - this is crucial for stable training
@@ -648,7 +648,7 @@ def train(args):
     )
     
     # Mixed precision training
-    scaler = GradScaler() if args.use_amp else None
+    scaler = GradScaler('cuda') if args.use_amp else None
     
     # For early stopping
     best_val_loss = float('inf')
@@ -692,7 +692,7 @@ def train(args):
             
             # Forward pass and loss calculation with gradient accumulation
             if args.use_amp:
-                with autocast():
+                with autocast('cuda'):
                     # Use the already computed loss
                     pass
                 
