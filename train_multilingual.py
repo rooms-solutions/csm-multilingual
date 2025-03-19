@@ -101,26 +101,36 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
         try:
             # Ensure proper size from backbone output
             embed_dim = backbone_output.size(-1)
-            # Create on the same device with explicit parameters
-            position_embeddings = torch.randn(
-                num_codebooks-1, 
-                embed_dim, 
-                device=device, 
-                dtype=dtype
-            ) * 0.02
+            # Create directly on the device with CUDA synchronization to ensure placement
+            with torch.cuda.device(device):
+                position_embeddings = torch.randn(
+                    num_codebooks-1, 
+                    embed_dim, 
+                    device=device, 
+                    dtype=dtype
+                ) * 0.02
+                # Synchronize to ensure tensor is created before continuing
+                torch.cuda.synchronize(device)
+                
             # Verify the device to be certain
             if position_embeddings.device != device:
                 logger.warning(f"Position embeddings on wrong device: {position_embeddings.device} vs expected {device}")
-                position_embeddings = position_embeddings.to(device=device, dtype=dtype)
+                # Force synchronous copy to device
+                position_embeddings = position_embeddings.to(device=device, dtype=dtype, non_blocking=False)
+                torch.cuda.synchronize(device)
         except Exception as embed_err:
             logger.error(f"Error creating position embeddings: {embed_err}")
             # Fallback creation with hard-coded size
-            position_embeddings = torch.randn(
-                num_codebooks-1, 
-                2048,  # Default backbone embedding size 
-                device=device, 
-                dtype=dtype
-            ) * 0.02
+            with torch.cuda.device(device):
+                position_embeddings = torch.randn(
+                    num_codebooks-1, 
+                    2048,  # Default backbone embedding size 
+                    device=device, 
+                    dtype=dtype,
+                    # Force creation on device
+                    requires_grad=False
+                ) * 0.02
+                torch.cuda.synchronize(device)
         
         for i in range(1, num_codebooks):
             # Use the backbone output directly with a position embedding
@@ -130,12 +140,15 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             codebook_h = last_h.squeeze(1) + position_embeddings[pos_idx]
             
             # Project backbone dimension (2048) to decoder dimension (1024) before matmul
-            projected_h = model.projection(codebook_h.unsqueeze(1)).to(dtype=dtype)
+            projected_h = model.projection(codebook_h.unsqueeze(1)).to(device=device, dtype=dtype)
+            
+            # Get audio head and ensure it's definitely on the correct device
+            audio_head_i = model.audio_head[i-1].to(device=device, dtype=dtype, non_blocking=False)
             
             # Get logits by matmul with the audio head - transpose the audio_head for correct multiplication
             ci_logits = torch.matmul(
-                projected_h.squeeze(1),  # Shape: [batch_size, decoder_dim]
-                model.audio_head[i-1].to(dtype=dtype)  # Shape: [decoder_dim, vocab_size]
+                projected_h.squeeze(1).to(device=device, non_blocking=False),  # Shape: [batch_size, decoder_dim]
+                audio_head_i  # Shape: [decoder_dim, vocab_size]
             )  # Result: [batch_size, vocab_size]
             
             # Extract target
@@ -227,7 +240,16 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 
                 # Ensure audio_head has correct shape and device for matrix multiplication
                 audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
-                
+            
+                # Force double-check on device before matmul to prevent errors
+                if audio_head.device != device:
+                    logger.warning(f"Audio head still on wrong device: {audio_head.device}, forcing to {device}")
+                    # Force non-blocking copy to device
+                    audio_head = audio_head.to(device=device, dtype=dtype, non_blocking=False)
+            
+                # Also ensure decoder_h_flat is on the correct device
+                decoder_h_flat = decoder_h_flat.to(device=device, dtype=dtype, non_blocking=False)
+            
                 # Add debug prints to trace device issues if needed
                 if args is not None and getattr(args, 'debug', False) and i == 1 and batch_idx < 2:
                     debug_info = {
@@ -237,11 +259,23 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                     }
                     logger.debug(f"Debug tensor device info: {debug_info}")
                 
-                # Log shapes for debugging
+                # Log shapes and devices for debugging
                 logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
-                
-                # Now do the final matmul
-                ci_logits = torch.matmul(decoder_h_flat, audio_head)
+                logger.debug(f"Before matmul - decoder_h_flat device: {decoder_h_flat.device}, audio_head device: {audio_head.device}")
+            
+                # Now do the final matmul with guaranteed device matching
+                try:
+                    ci_logits = torch.matmul(decoder_h_flat, audio_head)
+                except RuntimeError as e:
+                    if "device" in str(e).lower():
+                        # Last attempt with synchronized device transfer
+                        logger.warning("Matmul device error, making final attempt with synchronized transfer")
+                        with torch.cuda.device(device):
+                            decoder_h_flat = decoder_h_flat.to(device, non_blocking=False)
+                            audio_head = audio_head.to(device, non_blocking=False)
+                            ci_logits = torch.matmul(decoder_h_flat, audio_head)
+                    else:
+                        raise
             
             # Extract target as 1D tensor - always clone to avoid in-place issues
             if audio_tokens.dim() == 3:

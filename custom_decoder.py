@@ -74,10 +74,22 @@ class SimpleDecoderAttention(nn.Module):
                 # Default to [0, 1] positions
                 position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
         
+        # Ensure input is on the correct device and has the right dtype
+        device = x.device
+        dtype = x.dtype
+        
         # Project queries, keys, values
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Ensure tensors are on the expected device
+        if q.device != device:
+            q = q.to(device=device, dtype=dtype, non_blocking=False)
+        if k.device != device:
+            k = k.to(device=device, dtype=dtype, non_blocking=False)
+        if v.device != device:
+            v = v.to(device=device, dtype=dtype, non_blocking=False)
         
         # Apply our custom RoPE
         q = self.pos_embed(q, position_ids)
@@ -91,8 +103,12 @@ class SimpleDecoderAttention(nn.Module):
         # Compute attention scores
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
-        # Apply mask
+        # Apply mask - ensure same device first
         if mask is not None:
+            # Ensure mask is on the same device as attn_weights
+            if mask.device != attn_weights.device:
+                mask = mask.to(device=attn_weights.device)
+                
             # Handle different mask formats
             if mask.dim() == 3:  # [batch, seq, seq]
                 attn_weights = attn_weights.masked_fill(~mask.unsqueeze(1), float('-inf'))
