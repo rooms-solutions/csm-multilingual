@@ -121,10 +121,19 @@ class Model(nn.Module):
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         
-        # First completely clear model caches
-        self.reset_caches()
-        
-        # Create the backbone and decoder causal masks
+        # Force completely rebuilding caches with the current batch size
+        # First try to destroy any existing caches
+        try:
+            # Try to destroy existing caches by calling private methods if available
+            if hasattr(self.backbone, '_destroy_kv_cache'):
+                self.backbone._destroy_kv_cache()
+            if hasattr(self.decoder, '_destroy_kv_cache'):
+                self.decoder._destroy_kv_cache()
+        except Exception:
+            # If destroy fails, try to reset
+            self.reset_caches()
+            
+        # Create fresh causal masks
         backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
         backbone_mask = _create_causal_mask(backbone_max_seq_len, device)
         # Always use size 2 for decoder to ensure consistent dimensions
@@ -134,36 +143,55 @@ class Model(nn.Module):
         self.register_buffer("backbone_causal_mask", backbone_mask)
         self.register_buffer("decoder_causal_mask", decoder_mask)
         
-        # Configure decoder's position embeddings for consistent dimensions
+        # Store current batch size as an attribute to check later
+        self._current_batch_size = max_batch_size
+        
+        # Configure all layers explicitly for the given batch size
         if hasattr(self.decoder, 'layers'):
             for layer in self.decoder.layers:
-                if hasattr(layer, 'attn') and hasattr(layer.attn, 'pos_embeddings'):
-                    # Try to configure positional embeddings for sequence length 2
-                    if hasattr(layer.attn.pos_embeddings, 'setup'):
-                        try:
-                            layer.attn.pos_embeddings.setup(
-                                max_batch_size=max_batch_size,
-                                max_seq_len=2,
-                                dtype=dtype,
-                                device=device
-                            )
-                        except Exception:
-                            pass
-                            
+                if hasattr(layer, 'attn'):
+                    # Set attributes directly if possible
+                    if hasattr(layer.attn, 'max_batch_size'):
+                        layer.attn.max_batch_size = max_batch_size
+                    
+                    # Configure positional embeddings
+                    if hasattr(layer.attn, 'pos_embeddings'):
+                        if hasattr(layer.attn.pos_embeddings, 'setup'):
+                            try:
+                                # Always use seq_len=2 for decoder position embeddings
+                                layer.attn.pos_embeddings.setup(
+                                    max_batch_size=max_batch_size,
+                                    max_seq_len=2,
+                                    dtype=dtype,
+                                    device=device
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to setup position embeddings: {e}")
+        
         # Actually setup the backbone and decoder caches with consistent dimensions
+        # Using a more direct approach to ensure it works
+        
+        # For backbone
         try:
             if hasattr(self.backbone, 'setup_caches'):
                 self.backbone.setup_caches(max_batch_size, dtype)
-        except Exception:
-            pass
-            
+            # Additional check for setting up kv cache directly
+            elif hasattr(self.backbone, 'setup_kv_cache'):
+                self.backbone.setup_kv_cache(max_batch_size)
+        except Exception as e:
+            logger.warning(f"Failed to setup backbone caches: {e}")
+        
+        # For decoder - the most important part
         try:
             if hasattr(self.decoder, 'setup_caches'):
                 # Always use sequence length 2 for decoder
                 self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
-        except Exception:
-            pass
-            
+            # Additional check for setting up kv cache directly
+            elif hasattr(self.decoder, 'setup_kv_cache'):
+                self.decoder.setup_kv_cache(max_batch_size, max_seq_len=2)
+        except Exception as e:
+            logger.warning(f"Failed to setup decoder caches: {e}")
+        
         return backbone_mask
 
     def generate_frame(
@@ -250,6 +278,17 @@ class Model(nn.Module):
                 self.decoder.reset_caches()
         except Exception:
             pass
+    
+    def validate_batch_size(self, batch_size):
+        """Check if current caches are compatible with given batch size.
+        
+        Returns True if compatible, False otherwise.
+        """
+        expected_batch_size = getattr(self, '_current_batch_size', None)
+        if expected_batch_size is None:
+            return True
+        
+        return expected_batch_size == batch_size
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
         """Embed audio tokens with enhanced dimension handling"""

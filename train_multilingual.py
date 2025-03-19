@@ -143,12 +143,27 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 torch.ones(2, 2, dtype=torch.bool, device=device)
             ).unsqueeze(0).expand(b, 2, 2)
             
+            # Check for batch size consistency with decoder caches
+            expected_batch_size = getattr(model, '_current_batch_size', None)
+            current_batch_size = decoder_input.size(0)
+            
+            # If batch sizes don't match, try to rebuild caches
+            if expected_batch_size is not None and expected_batch_size != current_batch_size:
+                logger.info(f"Detected batch size change: {expected_batch_size} -> {current_batch_size}. Rebuilding caches.")
+                # Try to rebuild caches with current batch size
+                model.setup_caches(current_batch_size)
+            
             # Use the decoder with the correct input shapes
             try:
                 # Reshape decoder input if needed for consistency
                 if decoder_input.size(1) != 2:
                     decoder_input = decoder_input[:, :2].contiguous()
-                    
+                
+                # Make sure decoder's internal state has right batch size
+                # Some decoders have internal batch tracking that needs to be consistent
+                if hasattr(model.decoder, '_batch_size') and model.decoder._batch_size != current_batch_size:
+                    model.decoder._batch_size = current_batch_size
+                
                 # Use the decoder directly with the right shapes
                 decoder_h = model.decoder(
                     decoder_input,
