@@ -97,9 +97,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
         # We'll use direct prediction with linear layers instead
         
         # Create a position embedding matrix for each codebook position
-        position_embeddings = nn.Parameter(
-            torch.randn(num_codebooks-1, backbone_output.size(-1), device=device, dtype=dtype) * 0.02
-        )
+        position_embeddings = torch.randn(num_codebooks-1, backbone_output.size(-1), device=device, dtype=dtype) * 0.02
         
         for i in range(1, num_codebooks):
             # Use the backbone output directly with a position embedding
