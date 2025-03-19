@@ -133,6 +133,9 @@ def train_language(args, language):
     
     if args.use_amp:
         cmd.append("--use_amp")
+        
+    if args.amp_compatibility_mode:
+        cmd.append("--amp_compatibility_mode")
     
     # Add gradient accumulation and num_workers if specified
     if args.gradient_accumulation_steps > 1:
@@ -191,6 +194,8 @@ def main():
                         help="Device (cuda or cpu)")
     parser.add_argument("--use_amp", action="store_true",
                         help="Use automatic mixed precision")
+    parser.add_argument("--amp_compatibility_mode", action="store_true",
+                        help="Use compatibility mode for AMP with BFloat16")
     
     # Workflow control
     parser.add_argument("--prepare_only", action="store_true",

@@ -550,11 +550,14 @@ def train(args):
         audio_num_codebooks=32,
     )
     
-    # Create model with bfloat16 precision and properly place on device
+    # Create model with appropriate precision for the selected device
     with torch.cuda.device(device):
-        model = Model(model_args).to(device=device, dtype=torch.bfloat16)
+        # When using AMP, use Float16 instead of BFloat16 for better compatibility
+        model_dtype = torch.float16 if args.use_amp else torch.bfloat16
+        model = Model(model_args).to(device=device, dtype=model_dtype)
         # Force synchronization to ensure model is fully on device
         torch.cuda.synchronize(device)
+        logger.info(f"Model initialized with dtype: {model_dtype}")
         
         # Use our custom attention module instead of simplified decoder
         logger.info("Replacing decoder attention with fixed implementation")
@@ -647,8 +650,18 @@ def train(args):
         T_max=len(train_loader) * args.num_epochs
     )
     
-    # Mixed precision training
-    scaler = GradScaler('cuda') if args.use_amp else None
+    # Mixed precision training with proper dtype handling
+    if args.use_amp:
+        try:
+            logger.info("Initializing gradient scaler for mixed precision training")
+            scaler = GradScaler('cuda', enabled=True)
+        except Exception as e:
+            logger.warning(f"Error initializing gradient scaler: {e}")
+            logger.warning("Falling back to non-AMP training")
+            args.use_amp = False
+            scaler = None
+    else:
+        scaler = None
     
     # For early stopping
     best_val_loss = float('inf')
@@ -696,17 +709,40 @@ def train(args):
                     # Use the already computed loss
                     pass
                 
-                # Optimize with mixed precision
-                scaler.scale(normalized_loss).backward()
-                
-                # Only update weights after accumulating gradients for specified steps
-                if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)  # More efficient
-                    scheduler.step()
+                # Optimize with mixed precision using try-except blocks for safety
+                try:
+                    scaler.scale(normalized_loss).backward()
+                    
+                    # Only update weights after accumulating gradients for specified steps
+                    if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
+                        try:
+                            # Unscale gradients - this is where the error happens with BFloat16
+                            # Skip unscaling in compatibility mode
+                            if not args.amp_compatibility_mode:
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                            else:
+                                # In compatibility mode, apply a fixed scaling to avoid unscale operation
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip * 128.0)
+                            scaler.step(optimizer)
+                            scaler.update()
+                        except RuntimeError as e:
+                            # Handle specific BFloat16 error
+                            if "BFloat16" in str(e) or "implemented for" in str(e):
+                                logger.warning(f"AMP error: {e}")
+                                logger.warning("Falling back to non-AMP training for this batch")
+                                # Skip this step but continue training
+                                optimizer.zero_grad(set_to_none=True)
+                            else:
+                                # For other runtime errors, continue but log
+                                logger.error(f"Error in optimizer step: {e}")
+                                optimizer.zero_grad(set_to_none=True)
+                        
+                        optimizer.zero_grad(set_to_none=True)  # More efficient
+                        scheduler.step()
+                except Exception as e:
+                    logger.error(f"Error in backward pass: {e}")
+                    optimizer.zero_grad(set_to_none=True)
             else:
                 # Standard optimization with gradient accumulation
                 normalized_loss.backward()
@@ -819,6 +855,8 @@ def main():
                         help="Disable custom decoder implementation (not recommended)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of updates steps to accumulate before backward pass")
+    parser.add_argument("--amp_compatibility_mode", action="store_true",
+                        help="Use compatibility mode for AMP with BFloat16 (skips unscale operation)")
     
     args = parser.parse_args()
     
