@@ -244,11 +244,13 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 # Force double-check on device before matmul to prevent errors
                 if audio_head.device != device:
                     logger.warning(f"Audio head still on wrong device: {audio_head.device}, forcing to {device}")
-                    # Force non-blocking copy to device
+                    # Force non-blocking copy to device with synchronization
                     audio_head = audio_head.to(device=device, dtype=dtype, non_blocking=False)
+                    torch.cuda.synchronize(device)
             
-                # Also ensure decoder_h_flat is on the correct device
+                # Also ensure decoder_h_flat is on the correct device with synchronization
                 decoder_h_flat = decoder_h_flat.to(device=device, dtype=dtype, non_blocking=False)
+                torch.cuda.synchronize(device)
             
                 # Add debug prints to trace device issues if needed
                 if args is not None and getattr(args, 'debug', False) and i == 1 and batch_idx < 2:
@@ -265,15 +267,31 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             
                 # Now do the final matmul with guaranteed device matching
                 try:
-                    ci_logits = torch.matmul(decoder_h_flat, audio_head)
+                    # Explicitly detach and clone to avoid any reference issues
+                    decoder_h_flat_safe = decoder_h_flat.detach().clone().to(device=device, dtype=dtype, non_blocking=False)
+                    audio_head_safe = audio_head.detach().clone().to(device=device, dtype=dtype, non_blocking=False)
+                    
+                    # Force synchronization before operation
+                    torch.cuda.synchronize(device)
+                    
+                    # Check device one more time and log
+                    logger.debug(f"Final check - decoder_h_flat device: {decoder_h_flat_safe.device}, audio_head device: {audio_head_safe.device}")
+                    
+                    # Use safe copies for matmul
+                    ci_logits = torch.matmul(decoder_h_flat_safe, audio_head_safe)
                 except RuntimeError as e:
                     if "device" in str(e).lower():
-                        # Last attempt with synchronized device transfer
-                        logger.warning("Matmul device error, making final attempt with synchronized transfer")
+                        # Last attempt with completely new tensors
+                        logger.warning("Matmul device error, making final attempt with new tensors")
+                        # Create new tensors directly on device
                         with torch.cuda.device(device):
-                            decoder_h_flat = decoder_h_flat.to(device, non_blocking=False)
-                            audio_head = audio_head.to(device, non_blocking=False)
-                            ci_logits = torch.matmul(decoder_h_flat, audio_head)
+                            # Copy data to new tensors
+                            decoder_h_flat_new = torch.zeros_like(decoder_h_flat, device=device, dtype=dtype)
+                            decoder_h_flat_new.copy_(decoder_h_flat)
+                            audio_head_new = torch.zeros_like(audio_head, device=device, dtype=dtype)
+                            audio_head_new.copy_(audio_head)
+                            torch.cuda.synchronize(device)
+                            ci_logits = torch.matmul(decoder_h_flat_new, audio_head_new)
                     else:
                         raise
             
@@ -464,13 +482,26 @@ def train(args):
         audio_num_codebooks=32,
     )
     
-    # Create model with bfloat16 precision
-    model = Model(model_args).to(device=device, dtype=torch.bfloat16)
-    
-    # Use our custom attention module instead of simplified decoder
-    logger.info("Replacing decoder attention with fixed implementation")
-    model = fix_decoder_attention(model)
-    logger.info("Decoder attention modules replaced successfully")
+    # Create model with bfloat16 precision and properly place on device
+    with torch.cuda.device(device):
+        model = Model(model_args).to(device=device, dtype=torch.bfloat16)
+        # Force synchronization to ensure model is fully on device
+        torch.cuda.synchronize(device)
+        
+        # Use our custom attention module instead of simplified decoder
+        logger.info("Replacing decoder attention with fixed implementation")
+        model = fix_decoder_attention(model)
+        
+        # Force all parameters to be on correct device
+        for param in model.parameters():
+            if param.device != device:
+                param.data = param.data.to(device=device, non_blocking=False)
+        
+        # Extra synchronization
+        torch.cuda.synchronize(device)
+        
+        logger.info("Decoder attention modules replaced successfully")
+        logger.info(f"Verified model is on device: {next(model.parameters()).device}")
     
     # Load pre-trained weights if available
     if args.checkpoint:
@@ -585,7 +616,7 @@ def train(args):
             if args.use_amp:
                 with autocast():
                     total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
-                
+                    
                 # Optimize with mixed precision
                 optimizer.zero_grad(set_to_none=True)  # More efficient
                 scaler.scale(total_loss).backward()
@@ -595,12 +626,16 @@ def train(args):
                 scaler.update()
             else:
                 total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
-                
+                    
                 # Standard optimization
                 optimizer.zero_grad(set_to_none=True)  # More efficient
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
+                
+            # Force synchronization after each step
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
             
             scheduler.step()
             epoch_loss += total_loss.item()

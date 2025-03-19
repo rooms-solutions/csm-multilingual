@@ -52,6 +52,9 @@ class SimpleDecoderAttention(nn.Module):
         
         # Add cache-related attributes for compatibility
         self.cache_enabled = False
+        
+        # Register a device to help with tracking
+        self.register_buffer("_device_tracker", torch.zeros(1))
     
     def forward(self, x, *args, **kwargs):
         # Extract parameters with precedence to named arguments
@@ -95,6 +98,12 @@ class SimpleDecoderAttention(nn.Module):
         q = self.pos_embed(q, position_ids)
         k = self.pos_embed(k, position_ids)
         
+        # Force tensors to match input device before reshaping
+        device, dtype = x.device, x.dtype
+        q = q.to(device=device, dtype=dtype, non_blocking=True)
+        k = k.to(device=device, dtype=dtype, non_blocking=True)
+        v = v.to(device=device, dtype=dtype, non_blocking=True)
+        
         # Reshape for attention computation
         q = q.transpose(1, 2)  # [batch, heads, seq, dim]
         k = k.transpose(1, 2)
@@ -137,13 +146,26 @@ class SimpleDecoderAttention(nn.Module):
 def fix_decoder_attention(model):
     """Replace problematic attention modules with our fixed implementation"""
     if hasattr(model.decoder, 'layers'):
+        # Get device from model
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        
         for i, layer in enumerate(model.decoder.layers):
             if hasattr(layer, 'attn'):
                 # Get dimensions from existing layer
                 embed_dim = layer.attn.q_proj.out_features if hasattr(layer.attn, 'q_proj') else 1024
                 num_heads = layer.attn.num_heads if hasattr(layer.attn, 'num_heads') else 8
                 
-                # Replace with our custom implementation
-                layer.attn = SimpleDecoderAttention(embed_dim, num_heads)
-                print(f"Replaced attention in decoder layer {i}")
+                # Replace with our custom implementation and ensure it's on the same device
+                new_attn = SimpleDecoderAttention(embed_dim, num_heads)
+                new_attn = new_attn.to(device=device, dtype=dtype)
+                
+                # Force synchronization to ensure module is on the correct device
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                
+                # Replace the attention module
+                layer.attn = new_attn
+                print(f"Replaced attention in decoder layer {i} - device: {new_attn._device_tracker.device}")
+    
     return model
