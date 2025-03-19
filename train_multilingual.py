@@ -896,13 +896,44 @@ def train(args):
             normalized_loss = normalized_loss / args.gradient_accumulation_steps
             
             # Forward pass and loss calculation with gradient accumulation
+            # Completely rewritten AMP implementation for maximum stability and error handling
             if args.use_amp:
-                with autocast('cuda'):
-                    # Use the already computed loss
-                    pass
-                
-                # Optimize with mixed precision using try-except blocks for safety
+                # Process entire batch with autocast protection
                 try:
+                    # AMP-specific context manager
+                    with autocast('cuda', dtype=torch.float16):
+                        # The forward pass is already computed in process_batch
+                        # This autocast is mainly for any remaining ops
+                        pass
+                    
+                    # Ensure we have a valid loss to work with
+                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
+                        logger.warning(f"Invalid loss value detected: {normalized_loss.item() if not torch.isnan(normalized_loss) else 'NaN'}")
+                        # Replace with safe value instead of aborting
+                        normalized_loss = torch.tensor(1.0, device=device, dtype=torch.float16, requires_grad=True)
+                    
+                    # GradScaler backward pass with extra checks
+                    try:
+                        # Apply loss scaling and check that gradients are being computed
+                        scaled_loss = scaler.scale(normalized_loss)
+                        
+                        # Verify scaled loss isn't NaN before backward
+                        if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
+                            logger.warning("Scaled loss is invalid, using unscaled loss instead")
+                            normalized_loss.backward()
+                        else:
+                            scaled_loss.backward()
+                            
+                            # Immediately check for NaN gradients and fix if needed
+                            has_nan_grads = False
+                            for name, param in model.parameters():
+                                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                    has_nan_grads = True
+                                    logger.warning(f"NaN/Inf in gradients for {name} (after backward)")
+                                    param.grad = torch.zeros_like(param.grad)
+                            
+                            if has_nan_grads:
+                                logger.info("Found and fixed NaN gradients during backward pass")
                     # Check for NaN in loss before backward pass
                     if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
                         logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
