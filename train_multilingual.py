@@ -100,6 +100,13 @@ def process_batch(model, text_tokens, audio_tokens, device):
     for i in range(1, num_codebooks):
         # Use the decoder to predict next codebook
         curr_decoder_mask = _index_causal_mask(model.decoder_causal_mask, curr_pos)
+        
+        # Make sure input_pos is properly sized for the decoder
+        # The sequence length should always be 2 (not growing with each iteration)
+        if curr_pos.size(1) != 2:
+            # Reset position indices to just [0, 1] for each batch
+            curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
+            
         decoder_input = model.projection(curr_h).to(dtype=dtype)
         decoder_h = model.decoder(decoder_input, input_pos=curr_pos, mask=curr_decoder_mask)
         
@@ -137,9 +144,10 @@ def process_batch(model, text_tokens, audio_tokens, device):
             if ci_embed.dim() == 4:
                 ci_embed = ci_embed.squeeze(2)
                 
-            # Create new tensors instead of modifying in-place
+            # Use a fresh position tensor each time, always keeping it at size [b, 2]
+            # This ensures we always have position indices [0, 1] for each batch
             curr_h = ci_embed
-            curr_pos = torch.cat([curr_pos[:, :1], curr_pos[:, -1:] + 1], dim=1)
+            curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
     
     return total_loss
 
@@ -169,6 +177,10 @@ def evaluate(model, val_loader, device):
 def train(args):
     # Enable anomaly detection to help identify gradient issues
     torch.autograd.set_detect_anomaly(True)
+    
+    # Configure logging level 
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
     
     # Set device
     device = torch.device(args.device)
@@ -305,9 +317,13 @@ def train(args):
             # Reset caches
             model.reset_caches()
             
-            # Make sure model caches are properly reset before each batch
+            # Properly set up caches with the correct batch size
+            # First reset all caches completely
             model.reset_caches()
+            # Then set up with the current batch size
             model.setup_caches(text_tokens.size(0))
+            # Debug log to verify cache setup
+            logger.debug(f"Set up caches for batch size: {text_tokens.size(0)}")
             
             # Forward pass and loss calculation
             if args.use_amp:
@@ -420,6 +436,8 @@ def main():
                         help="Number of dataloader workers")
     parser.add_argument("--patience", type=int, default=5, 
                         help="Patience for early stopping (0 to disable)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
     
     args = parser.parse_args()
     

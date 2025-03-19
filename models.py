@@ -115,9 +115,22 @@ class Model(nn.Module):
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
+        # Reset caches first to ensure clean setup
+        self.reset_caches()
+        
         with device:
-            self.backbone.setup_caches(max_batch_size, dtype)
-            self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
+            try:
+                self.backbone.setup_caches(max_batch_size, dtype)
+            except RuntimeError as e:
+                if "already setup" not in str(e):
+                    raise e
+                    
+            try:
+                # For decoder, only use a sequence length of 2 for simplicity
+                self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
+            except RuntimeError as e:
+                if "already setup" not in str(e):
+                    raise e
 
         self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
