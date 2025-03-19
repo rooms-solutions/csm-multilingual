@@ -54,7 +54,52 @@ class SimpleDecoderAttention(nn.Module):
         self.cache_enabled = False
     
     def forward(self, x, mask=None, position_ids=None, input_pos=None):
+        batch_size, seq_len, _ = x.shape
         
+        # Default positions if not provided
+        if position_ids is None:
+            if input_pos is not None:
+                # Use input_pos if provided (compatibility with original interface)
+                position_ids = input_pos
+            else:
+                # Default to [0, 1] positions
+                position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
+        
+        # Project queries, keys, values
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Apply our custom RoPE
+        q = self.pos_embed(q, position_ids)
+        k = self.pos_embed(k, position_ids)
+        
+        # Reshape for attention computation
+        q = q.transpose(1, 2)  # [batch, heads, seq, dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Apply mask
+        if mask is not None:
+            # Handle different mask formats
+            if mask.dim() == 3:  # [batch, seq, seq]
+                attn_weights = attn_weights.masked_fill(~mask.unsqueeze(1), float('-inf'))
+            elif mask.dim() == 2:  # [seq, seq]
+                attn_weights = attn_weights.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # Get attention probabilities
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        # Apply attention weights
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        return self.out_proj(attn_output)
+    
     def caches_are_enabled(self):
         """Return whether caching is enabled (always False for our implementation)"""
         return False
