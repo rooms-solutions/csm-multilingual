@@ -211,9 +211,12 @@ class Model(nn.Module):
             ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
                 
             # Use our fixed decoder that properly handles the positions
-            decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
-                dtype=dtype
-            )
+            # Use kwargs-style for mask to avoid parameter conflicts
+            decoder_h = self.decoder(
+                self.projection(curr_h), 
+                input_pos=curr_pos, 
+                mask=curr_decoder_mask
+            ).to(dtype=dtype)
             ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
             ci_sample = sample_topk(ci_logits, topk, temperature)
             ci_embed = self._embed_audio(i, ci_sample)
