@@ -151,9 +151,16 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
         ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
         total_loss += ci_loss
         
-        # Process with decoder
-        decoder_input = model.projection(codebook_h.unsqueeze(1))
-        
+        # Process with decoder - ensure we have the expected sequence length of 2
+        decoder_input_single = model.projection(codebook_h.unsqueeze(1))
+        # Create a tensor of shape [batch_size, 2, dim] with consistent dimensions
+        batch_size = decoder_input_single.size(0)
+        dim = decoder_input_single.size(2)
+        decoder_input = torch.cat([
+            decoder_input_single,
+            torch.zeros(batch_size, 1, dim, device=decoder_input_single.device, dtype=decoder_input_single.dtype)
+        ], dim=1)
+            
         # Fixed positions for decoder
         decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
         decoder_positions[:, 1] = 1

@@ -81,6 +81,9 @@ class SimpleDecoderAttention(nn.Module):
         # Add cache-related attributes for compatibility
         self.cache_enabled = False
         
+        # Add warning tracker to avoid spamming logs
+        self._has_warned = False
+        
         # Register a device to help with tracking
         self.register_buffer("_device_tracker", torch.zeros(1))
     
@@ -99,8 +102,10 @@ class SimpleDecoderAttention(nn.Module):
         # Very important: make sure we have exactly seq_len=2 for our fixed positions case
         # If not, we need to pad or truncate the input
         if seq_len != 2:
-            # Log the unexpected sequence length
-            print(f"Warning: Expected seq_len=2 but got {seq_len}, adjusting to fixed size")
+            # Log warning only once to avoid spamming
+            if not self._has_warned:
+                print(f"Note: SimpleDecoderAttention adjusting sequence length from {seq_len} to 2 for fixed position model")
+                self._has_warned = True
             
             if seq_len > 2:
                 # Only use the first 2 positions if input is too long
