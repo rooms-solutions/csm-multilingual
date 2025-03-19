@@ -30,69 +30,28 @@ from custom_decoder import fix_decoder_attention
 
 def safe_matmul(tensor1, tensor2, device):
     """
-    Perform matrix multiplication with guaranteed device compatibility.
-    This function ensures both tensors are on the same device before multiplication.
+    Simplified matrix multiplication - PyTorch handles device compatibility automatically.
     """
-    # Normalize device to torch.device object with proper index
-    if isinstance(device, str):
-        actual_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
-    else:
-        actual_device = device
-    
-    # Move tensors to correct device WITHOUT detaching to preserve gradients
-    tensor1_safe = tensor1.to(device=actual_device, non_blocking=False)
-    tensor2_safe = tensor2.to(device=actual_device, non_blocking=False)
-    
-    # Force synchronization
-    if actual_device.type == "cuda":
-        torch.cuda.synchronize(actual_device)
-    
-    # Perform the matrix multiplication
-    return torch.matmul(tensor1_safe, tensor2_safe)
+    # Just use standard matmul - PyTorch will handle device compatibility
+    return torch.matmul(tensor1, tensor2)
 
-def numerically_stable_cross_entropy(logits, targets, epsilon=1e-5):
+def numerically_stable_cross_entropy(logits, targets):
     """
-    Compute cross entropy loss with enhanced numerical stability for AMP training.
+    Compute cross entropy loss with basic numerical stability.
     
     Args:
         logits: Model predictions
         targets: Target indices
-        epsilon: Small value to avoid log(0)
         
     Returns:
-        Numerically stable cross entropy loss
+        Cross entropy loss
     """
-    # Handle NaN/Inf values more aggressively
+    # Simple NaN handling
     if torch.isnan(logits).any() or torch.isinf(logits).any():
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
     
-    # Get shape information
-    batch_size = logits.size(0)
-    
-    # For AMP compatibility, avoid potential precision issues
-    # Use direct cross entropy instead of manual calculation
-    try:
-        # Use PyTorch's cross_entropy which has better numerical stability
-        loss = torch.nn.functional.cross_entropy(logits, targets)
-        
-        # Safety check for the result
-        if torch.isnan(loss) or torch.isinf(loss):
-            # Fallback to more careful approach
-            # Limit the range of logits to avoid extreme values
-            logits = torch.clamp(logits, -1e4, 1e4)
-            loss = torch.nn.functional.cross_entropy(logits, targets)
-    except Exception as e:
-        # Last resort fallback
-        # Apply very aggressive normalization
-        logits = (logits - logits.mean(dim=1, keepdim=True)) / (logits.std(dim=1, keepdim=True) + 1e-8)
-        loss = torch.nn.functional.cross_entropy(logits, targets)
-    
-    # Final check to ensure we return a valid loss
-    if torch.isnan(loss) or torch.isinf(loss):
-        # Return a stable default loss that can be backpropagated
-        return torch.tensor(10.0, device=logits.device, dtype=logits.dtype, requires_grad=True)
-    
-    return loss
+    # Use PyTorch's cross_entropy which already has good numerical stability
+    return torch.nn.functional.cross_entropy(logits, targets)
 
 # Configure logging
 logging.basicConfig(
@@ -107,441 +66,145 @@ logger = logging.getLogger("train_multilingual")
 
 def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx=0):
     """Process a single batch and calculate the loss with a simplified approach"""
-    # Debug info using logger instead of print
+    # Debug info using logger
     logger.debug(f"Text tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
-    logger.debug(f"Model dtype: {next(model.parameters()).dtype}")
+
+    # Create input format
+    b, s = text_tokens.size()
+    text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
+    text_frame[:, :, -1] = text_tokens
+    text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
+    text_frame_mask[:, :, -1] = True
+
+    # Get input positions
+    input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
     
-    # Set up robust error handling
-    try:
-        # Create input format - use clone() to avoid in-place modifications
-        b, s = text_tokens.size()
-        text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
-        text_frame[:, :, -1] = text_tokens.clone()
-        text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
-        text_frame_mask[:, :, -1] = True
+    # Forward pass through backbone
+    embeds = model._embed_tokens(text_frame)
+    masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
+    h = masked_embeds.sum(dim=2)
+
+    # Create backbone causal mask
+    seq_len = text_tokens.size(1)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
+    backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
     
-        # Get input positions - avoid in-place repeat
-        input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
-        
-        # Forward pass through backbone
-        embeds = model._embed_tokens(text_frame)
-        masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
-        h = masked_embeds.sum(dim=2)
+    # Get model's dtype for consistent operations
+    dtype = next(model.parameters()).dtype
+    backbone_output = backbone_output.to(dtype=dtype)
     
-        # Create a properly shaped backbone causal mask - this is key to making it work
-        seq_len = text_tokens.size(1)
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-        curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
-        backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
-        
-        # Get model's dtype and ensure consistent dtype for operations
-        dtype = next(model.parameters()).dtype
-        backbone_output = backbone_output.to(dtype=dtype)
-        
-        # Last hidden state for each sequence
-        last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
-        
-        # Codebook predictions and loss calculation
-        num_codebooks = audio_tokens.size(1)
-        total_loss = 0
+    # Last hidden state for each sequence
+    last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
     
-        # First codebook prediction using the backbone output
-        c0_logits = model.codebook0_head(last_h.squeeze(1).to(dtype=dtype))
-        
-        # Extract target as 1D tensor
-        if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
-            c0_targets = audio_tokens[:, 0, 0].clone()  # Get first token of first codebook
-        else:  # If shape is [batch_size, num_codebooks]
-            c0_targets = audio_tokens[:, 0].clone()  # Get first codebook
+    # Codebook predictions and loss calculation
+    num_codebooks = audio_tokens.size(1)
+    total_loss = 0
+
+    # First codebook prediction
+    c0_logits = model.codebook0_head(last_h.squeeze(1))
     
-        # Make sure targets are 1D
-        c0_targets = c0_targets.view(-1)
+    # Extract target
+    if audio_tokens.dim() == 3:
+        c0_targets = audio_tokens[:, 0, 0]
+    else:
+        c0_targets = audio_tokens[:, 0]
+    c0_targets = c0_targets.view(-1)
+    
+    # Calculate first codebook loss
+    c0_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
+    total_loss += c0_loss
+    
+    # Position embeddings for remaining codebooks
+    position_embeddings = torch.zeros(
+        num_codebooks-1, 
+        backbone_output.size(-1), 
+        device=device, 
+        dtype=dtype
+    )
+    
+    # Initialize with small random values
+    with torch.no_grad():
+        position_embeddings.normal_(0, 0.02)
         
-        # Use numerically stable cross entropy instead of standard version
+    for i in range(1, num_codebooks):
+        # Use backbone output with position embedding
+        pos_idx = i - 1
+        
+        # Add position embedding
+        codebook_h = last_h.squeeze(1) + position_embeddings[pos_idx]
+        
+        # Project to decoder dimension
+        projected_h = model.projection(codebook_h.unsqueeze(1))
+        
+        # Get logits
+        ci_logits = torch.matmul(projected_h.squeeze(1), model.audio_head[i-1])
+        
+        # Extract target
+        if audio_tokens.dim() == 3:
+            ci_targets = audio_tokens[:, i, 0]
+        else:
+            ci_targets = audio_tokens[:, i]
+        ci_targets = ci_targets.view(-1)
+        
+        # Calculate loss
+        ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
+        total_loss += ci_loss
+        
+        # Process with decoder
+        decoder_input = model.projection(codebook_h.unsqueeze(1))
+        
+        # Fixed positions for decoder
+        decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
+        decoder_positions[:, 1] = 1
+        
+        # Simple decoder mask
+        decoder_mask = torch.tril(
+            torch.ones(2, 2, dtype=torch.bool, device=device)
+        ).unsqueeze(0).expand(b, 2, 2)
+        
+        # Call decoder
         try:
-            # Check for NaN inputs first
-            if torch.isnan(c0_logits).any() or torch.isinf(c0_logits).any():
-                logger.warning(f"Detected NaN or Inf in c0_logits at batch {batch_idx}")
-                # Attempt to fix NaN/Inf values
-                c0_logits = torch.nan_to_num(c0_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-            
-            # Use our stable implementation
-            c0_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
-        except Exception as e:
-            logger.error(f"Error in c0 loss calculation: {e}")
-            # Fallback with very careful input handling - preserve gradients
-            c0_logits_safe = torch.nan_to_num(c0_logits, nan=0.0)
-            c0_loss = nn.functional.cross_entropy(c0_logits_safe, c0_targets)
-        
-        total_loss += c0_loss
-        
-        # For remaining codebooks, use a simplified approach without the decoder
-        # We'll use direct prediction with linear layers instead
-        
-        # Create a position embedding matrix for each codebook position
-        # Explicitly create on device with proper error handling
-        try:
-            # Ensure device is a torch.device object
-            if isinstance(device, str):
-                cuda_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
-            else:
-                cuda_device = device
-        
-            # Ensure proper size from backbone output
-            embed_dim = backbone_output.size(-1)
-        
-            # Create directly on the device with CUDA synchronization to ensure placement
-            position_embeddings = torch.zeros(
-                num_codebooks-1, 
-                embed_dim, 
-                device=cuda_device, 
-                dtype=dtype
+            decoder_h = model.decoder(
+                decoder_input,
+                input_pos=decoder_positions,
+                mask=decoder_mask
             )
-        
-            # Fill with random values directly on device
-            with torch.no_grad():
-                position_embeddings.normal_(0, 0.02)
-        
-            # Force synchronization
-            if cuda_device.type == "cuda":
-                torch.cuda.synchronize()
             
-            # No need to verify device since we created it directly on the right device
-        except Exception as embed_err:
-            logger.error(f"Error creating position embeddings: {embed_err}")
-            # Fallback creation with hard-coded size
-            with torch.cuda.device(device):
-                position_embeddings = torch.randn(
-                    num_codebooks-1, 
-                    2048,  # Default backbone embedding size 
-                    device=device, 
-                    dtype=dtype,
-                    # Force creation on device
-                    requires_grad=False
-                ) * 0.02
-                torch.cuda.synchronize(device)
-        
-        for i in range(1, num_codebooks):
-            # Use the backbone output directly with a position embedding
-            pos_idx = i - 1  # Index for position embedding (0-based)
+            # Get last hidden state
+            decoder_h_flat = decoder_h[:, -1, :]
             
-            # Add position embedding to create context for this codebook position
-            codebook_h = last_h.squeeze(1) + position_embeddings[pos_idx]
-            
-            # Project backbone dimension (2048) to decoder dimension (1024) before matmul
-            projected_h = model.projection(codebook_h.unsqueeze(1)).to(device=device, dtype=dtype)
-            
-            # Get audio head and ensure it's definitely on the correct device
-            audio_head_i = model.audio_head[i-1].to(device=device, dtype=dtype, non_blocking=False)
-            
-            # Get logits by matmul with the audio head using safe_matmul
-            ci_logits = safe_matmul(
-                projected_h.squeeze(1),  # Shape: [batch_size, decoder_dim]
-                audio_head_i,  # Shape: [decoder_dim, vocab_size]
-                device
-            )  # Result: [batch_size, vocab_size]
-            
-            # Extract target
-            if audio_tokens.dim() == 3:
-                ci_targets = audio_tokens[:, i, 0].clone()
-            else:
-                ci_targets = audio_tokens[:, i].clone()
-                
-            # Make sure targets are 1D
-            ci_targets = ci_targets.view(-1)
-            
-            # Calculate loss with numerical stability
-            try:
-                # Check for NaN/Inf values
-                if torch.isnan(ci_logits).any() or torch.isinf(ci_logits).any():
-                    logger.warning(f"Detected NaN or Inf in ci_logits for codebook {i} at batch {batch_idx}")
-                    ci_logits = torch.nan_to_num(ci_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-                
-                # Use our stable implementation
-                ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
-            except Exception as e:
-                logger.error(f"Error in ci_loss calculation for codebook {i}: {e}")
-                # Fallback with careful input handling - preserve gradients
-                ci_logits_safe = torch.nan_to_num(ci_logits, nan=0.0)
-                ci_loss = nn.functional.cross_entropy(ci_logits_safe, ci_targets, reduction='mean')
-            
-            total_loss += ci_loss
-            
-            # Use the decoder properly with consistent dimensions
-            # Project to decoder dimension and ensure correct dtype and device
-            decoder_input = model.projection(codebook_h.unsqueeze(1)).to(device=device, dtype=dtype)
-            
-            # Create fixed positions tensors with proper shape
-            decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
-            decoder_positions[:, 1] = 1  # Second position is 1
-            
-            # Create a properly sized causal mask for the decoder
-            # This is critical - the mask must be [batch_size, seq_len, seq_len]
-            decoder_mask = torch.tril(
-                torch.ones(2, 2, dtype=torch.bool, device=device)
-            ).unsqueeze(0).expand(b, 2, 2)
-            
-            try:
-                # Explicitly ensure all tensors have correct device before passing to decoder
-                decoder_input = decoder_input.to(device=device, dtype=dtype, non_blocking=False)
-                decoder_positions = decoder_positions.to(device=device, non_blocking=False)
-                decoder_mask = decoder_mask.to(device=device, non_blocking=False)
-                
-                # Force synchronize to ensure transfers complete
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(device)
-                
-                # Now use the proper decoder with our fixed attention implementation
-                # Make sure decoder_input has exactly 2 sequence positions [batch, 2, dim]
-                if decoder_input.size(1) != 2:
-                    # Adjust to exactly 2 sequence positions
-                    if decoder_input.size(1) > 2:
-                        # Truncate to 2 positions
-                        decoder_input = decoder_input[:, :2, :]
-                    else:
-                        # Pad to 2 positions by duplicating the last position
-                        pad = decoder_input[:, -1:, :].expand(-1, 2-decoder_input.size(1), -1)
-                        decoder_input = torch.cat([decoder_input, pad], dim=1)
-                
-                # Make sure decoder_positions is exactly [batch, 2] with values [0,1]
-                decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
-                decoder_positions[:, 1] = 1  # Set second position to 1
-            
-                # Verify decoder mask has the right dimensions [batch, 2, 2]
-                decoder_mask = torch.tril(
-                    torch.ones(2, 2, dtype=torch.bool, device=device)
-                ).unsqueeze(0).expand(b, 2, 2)
-            
-                # Pass to decoder with corrected dimensions
-                decoder_h = model.decoder(
-                    decoder_input, 
-                    input_pos=decoder_positions, 
-                    mask=decoder_mask
-                ).to(device=device, dtype=dtype)
-                
-                # Log once per batch
-                if i == 1:
-                    logger.debug("Using fixed decoder implementation with proper attention handling")
-            except Exception as decoder_err:
-                # Log the specific decoder error
-                logger.error(f"Decoder error: {decoder_err}")
-                # Fall back to using the projected input directly
-                decoder_h = decoder_input.clone().to(device=device, dtype=dtype)
-            
-            # This duplicate logging was removed
-        
-            # Ensure decoder_h has the correct dtype
-            decoder_h = decoder_h.to(dtype=dtype)
-            
-            # Process the decoder output through our simplified decoder if available
-            if hasattr(model, 'simplified_decoders') and i-1 < len(model.simplified_decoders):
-                # Use our simple MLP for this codebook position
-                # Extract input features
-                if decoder_h.dim() == 3:
-                    # Shape is [batch_size, seq_len, dim]
-                    decoder_features = decoder_h[:, -1, :].to(dtype=dtype)
-                else:
-                    # Shape is [batch_size, dim]
-                    decoder_features = decoder_h.squeeze(1).to(dtype=dtype)
-                
-                # Process through the simplified decoder for this position
-                decoder_output = model.simplified_decoders[i-1](decoder_features)
-                
-                # Use the output directly for the logits calculation with our safe_matmul
-                try:
-                    # Use our custom safe_matmul function
-                    audio_head = model.audio_head[i-1]
-                    ci_logits = safe_matmul(decoder_output, audio_head, device)
-                except Exception as mm_err:
-                    logger.error(f"Matrix multiplication error in simplified decoder: {mm_err}")
-                    # Create fallback logits - without detaching to maintain gradients
-                    vocab_size = model.args.audio_vocab_size
-                    ci_logits = torch.zeros(decoder_output.size(0), vocab_size, device=device, dtype=dtype, requires_grad=True)
-                
-            else:
-                # Fallback to original approach if simplified decoders not available
-                # Handle logits calculation with careful dimension management
-                if decoder_h.dim() == 3:
-                    # Standard case - decoder_h is [batch_size, seq_len, decoder_dim]
-                    decoder_h_flat = decoder_h[:, -1, :].to(dtype=dtype)
-                elif decoder_h.dim() == 2:
-                    # Fallback case - decoder_h is [batch_size, decoder_dim]
-                    decoder_h_flat = decoder_h.squeeze(1).to(dtype=dtype)
-                else:
-                    # Unusual case - reshape to expected dimensions
-                    decoder_h_flat = decoder_h.view(b, -1, decoder_h.size(-1))[:, -1, :].to(dtype=dtype)
-                
-                # Ensure audio_head has correct shape and device for matrix multiplication
-                audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
-            
-                # Normalize device to device object format
-                if isinstance(device, str):
-                    actual_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
-                else:
-                    actual_device = device
-                
-                # Move tensors to device without unnecessary warnings
-                if audio_head.device != actual_device:
-                    # Force copy to device with synchronization
-                    audio_head = audio_head.to(device=actual_device, dtype=dtype, non_blocking=False)
-                    torch.cuda.synchronize(actual_device)
-            
-                # Ensure decoder_h_flat is on the correct device
-                decoder_h_flat = decoder_h_flat.to(device=actual_device, dtype=dtype, non_blocking=False)
-                torch.cuda.synchronize(actual_device)
-            
-                # Debug logging handled by logger based on log level
-            
-                # Now do the final matmul with our safe matrix multiplication function
-                try:
-                    # Use our custom safe_matmul function to guarantee device compatibility
-                    ci_logits = safe_matmul(decoder_h_flat, audio_head, device)
-                    
-                    # Log success
-                    if i == 1 and batch_idx < 2:
-                        logger.debug(f"Matrix multiplication successful with safe_matmul for position {i}")
-                except RuntimeError as e:
-                    if "device" in str(e).lower():
-                        # Last attempt with completely new tensors
-                        logger.warning("Matmul device error, making final attempt with new tensors")
-                        # Create new tensors directly on device - without detaching
-                        with torch.cuda.device(device):
-                            # Move tensors to device preserving gradients
-                            decoder_h_flat_new = decoder_h_flat.to(device=device, dtype=dtype, non_blocking=False)
-                            audio_head_new = audio_head.to(device=device, dtype=dtype, non_blocking=False)
-                            torch.cuda.synchronize(device)
-                            ci_logits = torch.matmul(decoder_h_flat_new, audio_head_new)
-                    else:
-                        raise
-            
-            # Extract target as 1D tensor - always clone to avoid in-place issues
-            if audio_tokens.dim() == 3:
-                ci_targets = audio_tokens[:, i, 0].clone()
-            else:
-                ci_targets = audio_tokens[:, i].clone()
-                
-            # Make sure targets are 1D
-            ci_targets = ci_targets.view(-1)
-            
-            # Calculate loss
+            # Second prediction of same codebook
+            ci_logits = torch.matmul(decoder_h_flat, model.audio_head[i-1])
             ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
             total_loss += ci_loss
-            
-            # Store individual loss for logging
-            if not hasattr(process_batch, 'individual_losses'):
-                process_batch.individual_losses = []
-            process_batch.individual_losses.append(ci_loss.item())
-            
-            # For next iteration, if not the last codebook
-            if i < num_codebooks - 1:
-                # Get embedding for the next codebook token with careful device handling
-                try:
-                    # Get tokens and ensure they're on the right device first
-                    if audio_tokens.dim() == 3:
-                        token_input = audio_tokens[:, i, 0].clone().view(-1, 1).to(device=device)
-                    else:
-                        token_input = audio_tokens[:, i].clone().view(-1, 1).to(device=device)
-                
-                    # Get embedding with device-prepared inputs
-                    ci_embed = model._embed_audio(i, token_input)
-                
-                    # Double-check the embedding device
-                    if ci_embed.device != device:
-                        ci_embed = ci_embed.to(device=device, dtype=dtype)
-                except Exception as embed_err:
-                    logger.error(f"Error in audio embedding for position {i}: {embed_err}")
-                    # Create fallback embedding that supports gradient flow
-                    embed_dim = decoder_h.size(-1)
-                    ci_embed = torch.zeros(
-                        decoder_h.size(0), 1, embed_dim, 
-                        device=device, dtype=dtype,
-                        requires_grad=True
-                    )
-            
-                # Fix dimensions - ensure consistent shape
-                if ci_embed.dim() == 4:
-                    ci_embed = ci_embed.squeeze(2)
-                
-                # Use a fresh position tensor each time, always keeping it at size [b, 2]
-                # This ensures we always have position indices [0, 1] for each batch
-                curr_h = ci_embed
-                curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
-    
-        # Normalize the loss by dividing by the number of codebooks
-        normalized_loss = total_loss / num_codebooks
-    
-        # Log individual losses occasionally to help debug
-        if batch_idx % 100 == 0:
-            logger.info(f"Avg codebook loss: {normalized_loss.item():.4f}, raw sum: {total_loss.item():.4f}")
-    
-        return normalized_loss  # Return normalized loss instead of total
-    except Exception as e:
-        # Handle any errors with a simplified fallback
-        logger.error(f"Error in process_batch: {e}")
+        except Exception as e:
+            # On decoder error, just log it
+            logger.debug(f"Using simplified path for codebook {i}: {e}")
+            # We already calculated loss with projected_h above, so no need to add again
         
-        try:
-            # Super simplified approach - just predict the first codebook
-            logger.info("Using super simplified fallback approach")
-            
-            # Create input format
-            b, s = text_tokens.size()
-            text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
-            text_frame[:, :, -1] = text_tokens.clone()
-            text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
-            text_frame_mask[:, :, -1] = True
-            
-            # Forward pass through backbone
-            embeds = model._embed_tokens(text_frame)
-            masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
-            h = masked_embeds.sum(dim=2)
-            
-            # Create backbone causal mask
-            seq_len = text_tokens.size(1)
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-            curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
-            
-            # Process through backbone
-            backbone_output = model.backbone(h, 
-                input_pos=torch.arange(s, device=device).unsqueeze(0).expand(b, s),
-                mask=curr_backbone_mask
-            )
-            
-            # Get model's dtype
-            dtype = next(model.parameters()).dtype
-            last_h = backbone_output[:, -1, :].to(dtype=dtype)
-            
-            # Only predict first codebook, ensuring everything is on the same device
-            # Force explicit device/dtype placement
-            last_h = last_h.to(device=device, dtype=dtype)
-            c0_logits = model.codebook0_head(last_h).to(device=device)
-            
-            # Extract target
+        # For next iteration, if not the last codebook
+        if i < num_codebooks - 1:
+            # Get embedding for next codebook token
             if audio_tokens.dim() == 3:
-                c0_targets = audio_tokens[:, 0, 0].clone()
+                token_input = audio_tokens[:, i, 0].view(-1, 1)
             else:
-                c0_targets = audio_tokens[:, 0].clone()
+                token_input = audio_tokens[:, i].view(-1, 1)
             
-            # Calculate loss for just first codebook with numerical stability
-            c0_targets = c0_targets.view(-1)
+            ci_embed = model._embed_audio(i, token_input)
             
-            # Clean up logits to prevent NaN - but maintain gradient flow
-            c0_logits = torch.nan_to_num(c0_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-            
-            # Apply scaling to prevent extreme values
-            if c0_logits.abs().max() > 1e4:
-                c0_logits = c0_logits * (1e4 / c0_logits.abs().max())
-            
-            # Use stable cross entropy
-            fallback_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
-            
-            logger.info(f"Fallback successful - only using first codebook loss: {fallback_loss.item()}")
-            return fallback_loss
-            
-        except Exception as nested_e:
-            # Last resort - return a dummy loss that can be backpropagated
-            logger.error(f"Fallback also failed: {nested_e}")
-            dummy_loss = torch.tensor(100.0, device=device, requires_grad=True)
-            return dummy_loss
+            # Ensure consistent shape
+            if ci_embed.dim() == 4:
+                ci_embed = ci_embed.squeeze(2)
+    
+    # Normalize the loss
+    normalized_loss = total_loss / num_codebooks
+    
+    # Log occasionally
+    if batch_idx % 100 == 0:
+        logger.info(f"Avg codebook loss: {normalized_loss.item():.4f}")
+    
+    return normalized_loss
 
 # Remove the reinitialize_caches function - we're not using caches at all
 
@@ -553,18 +216,12 @@ def evaluate(model, val_loader, device, args=None):
     
     with torch.no_grad():
         for batch in val_loader:
-            # Prepare input tensors - ensure they're on the right device
             text_tokens = batch["text_tokens"].to(device)
             audio_tokens = batch["audio_tokens"].to(device)
             
-            # Process batch with the same approach as training
             val_loss = process_batch(model, text_tokens, audio_tokens, device, args)
             total_val_loss += val_loss.item()
             total_batches += 1
-    
-            # Reset individual losses between batches for clean logging
-            if hasattr(process_batch, 'individual_losses'):
-                process_batch.individual_losses = []
     
     logger.info(f"Evaluated {total_batches} validation batches")
     return total_val_loss / total_batches if total_batches > 0 else float('inf')
@@ -839,167 +496,47 @@ def train(args):
             
             # Note: audio_waveform is now a list (not tensor) and not needed for training
             
-            # With caching disabled, we don't need to set up or reset caches
-            # Leave this empty block for clarity - no cache operations needed
-            pass
-            
-            # Normalize loss for gradient accumulation
+            # Process batch and get loss
             normalized_loss = total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
             normalized_loss = normalized_loss / args.gradient_accumulation_steps
-            
-            # Forward pass and loss calculation with gradient accumulation
-            # Completely rewritten AMP implementation for maximum stability and error handling
+                
+            # Handle AMP or standard training
             if args.use_amp:
-                # Process entire batch with autocast protection
-                try:
-                    # AMP-specific context manager
-                    with autocast('cuda', dtype=torch.float16):
-                        # The forward pass is already computed in process_batch
-                        # This autocast is mainly for any remaining ops
-                        pass
+                # Process with AMP
+                with autocast('cuda', dtype=torch.float16):
+                    # Most computation already done in process_batch
+                    pass
                     
-                    # Ensure we have a valid loss to work with
-                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
-                        logger.warning(f"Invalid loss value detected: {normalized_loss.item() if not torch.isnan(normalized_loss) else 'NaN'}")
-                        # Replace with safe value instead of aborting
-                        normalized_loss = torch.tensor(1.0, device=device, dtype=torch.float16, requires_grad=True)
+                # Handle any NaN values in loss
+                if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
+                    normalized_loss = torch.tensor(1.0, device=device, dtype=torch.float16, requires_grad=True)
                     
-                    # Check for NaN in loss before backward pass
-                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
-                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
-                        # Reset the loss to a stable value
-                        model_dtype = next(model.parameters()).dtype
-                        normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
+                # Backward pass with scaling
+                scaler.scale(normalized_loss).backward()
                     
-                    # GradScaler backward pass with extra checks
-                    try:
-                        # Apply loss scaling and check that gradients are being computed
-                        scaled_loss = scaler.scale(normalized_loss)
-                    
-                        # Verify scaled loss isn't NaN before backward
-                        if torch.isnan(scaled_loss) or torch.isinf(scaled_loss):
-                            logger.warning("Scaled loss is invalid, using unscaled loss instead")
-                            normalized_loss.backward()
-                        else:
-                            scaled_loss.backward()
+                # Only update after accumulating gradients
+                if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
+                    # Unscale gradients for clipping
+                    scaler.unscale_(optimizer)
                         
-                            # Immediately check for NaN gradients and fix if needed
-                            has_nan_grads = False
-                            for name, param in model.parameters():
-                                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                    has_nan_grads = True
-                                    logger.warning(f"NaN/Inf in gradients for {name} (after backward)")
-                                    param.grad = torch.zeros_like(param.grad)
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                         
-                            if has_nan_grads:
-                                logger.info("Found and fixed NaN gradients during backward pass")
-                    except Exception as backward_err:
-                        logger.warning(f"Error during backward pass: {backward_err}")
-                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item() if not torch.isnan(normalized_loss).all() else 'NaN'}")
-                        # Reset the loss to a stable value
-                        model_dtype = next(model.parameters()).dtype
-                        normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
-                    
-                        # Try a simpler backward pass as fallback
-                        try:
-                            scaler.scale(normalized_loss).backward()
-                        except Exception as fallback_err:
-                            logger.error(f"Fallback backward also failed: {fallback_err}")
-                    
-                    # Check for NaN gradients after backward
-                    grad_issues = check_gradients(model)
-                    if grad_issues:
-                        logger.warning("Fixed NaN/Inf gradients after backward pass")
-                    
-                    # Only update weights after accumulating gradients for specified steps
-                    if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
-                        # Completely reworked update logic with proper error handling
-                        if args.amp_compatibility_mode:
-                            # In compatibility mode, skip unscale_ operation entirely
-                            logger.debug("Using compatibility mode - skipping unscale")
-                                
-                            # Apply gradient clipping directly to scaled gradients
-                            # Use a fixed scaling factor to compensate for the scaling
-                            scale_factor = scaler._scale.item() if hasattr(scaler, '_scale') else 128.0
-                            adjusted_clip = args.grad_clip * scale_factor
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), adjusted_clip)
-                                
-                            # Step optimizer and update scaler without unscaling
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            # Standard AMP path with enhanced error handling
-                            try:
-                                # Safe unscaling with verification
-                                scaler.unscale_(optimizer)
-                                    
-                                # Extra verification after unscaling
-                                has_nans = False
-                                for name, param in model.parameters():
-                                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                        has_nans = True
-                                        logger.debug(f"NaN gradient in {name} after unscaling")
-                                        param.grad = torch.zeros_like(param.grad)
-                                    
-                                # Apply gradient clipping to unscaled gradients
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                                    
-                                # Step and update
-                                scaler.step(optimizer)
-                                scaler.update()
-                                    
-                            except RuntimeError as unscale_err:
-                                if "BFloat16" in str(unscale_err) or "not implemented" in str(unscale_err):
-                                    logger.warning(f"Unscale error: {unscale_err}")
-                                    logger.warning("Switching to compatibility mode for this update")
-                                        
-                                    # Apply fixed scaling as a fallback
-                                    scale_factor = scaler._scale.item() if hasattr(scaler, '_scale') else 128.0
-                                    adjusted_clip = args.grad_clip * scale_factor
-                                    torch.nn.utils.clip_grad_norm_(model.parameters(), adjusted_clip)
-                                        
-                                    # Try to step without unscaling
-                                    try:
-                                        scaler.step(optimizer)
-                                        scaler.update()
-                                    except Exception as step_err:
-                                        logger.error(f"Error in optimizer step: {step_err}")
-                                        # Last resort: update optimizer directly
-                                        optimizer.step()
-                                        scheduler.step()  # Make sure to update scheduler after optimizer
-                                else:
-                                    # For non-BFloat16 errors, log but still try to continue
-                                    logger.error(f"Unexpected error in unscale: {unscale_err}")
-                                    optimizer.step()  # Try regular step as fallback
-                                    scheduler.step()  # Make sure to update scheduler after optimizer
-                        
-                        optimizer.zero_grad(set_to_none=True)  # More efficient
-                        # scheduler.step() moved to after optimizer.step() in all paths
-                except Exception as e:
-                    logger.error(f"Error in backward pass: {e}")
+                    # Step with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
             else:
-                # Standard optimization with gradient accumulation
-                # Check for NaN in loss before backward pass
-                if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
-                    logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
-                    # Reset the loss to a stable value
-                    model_dtype = next(model.parameters()).dtype
-                    normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
-                
+                # Standard training path
                 normalized_loss.backward()
-                
-                # Check for NaN gradients after backward
-                grad_issues = check_gradients(model)
-                if grad_issues:
-                    logger.warning("Fixed NaN/Inf gradients after backward pass")
-                
-                # Only update weights after accumulating gradients for specified steps
+                    
+                # Update after accumulation
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     optimizer.step()
-                    scheduler.step()  # Immediately after optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)  # More efficient
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
                 
             # Force synchronization after parameter updates
             if torch.cuda.is_available() and ((batch_idx + 1) % args.gradient_accumulation_steps == 0):
