@@ -145,7 +145,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
             ).unsqueeze(0).expand(b, 2, 2)
             
             # Now use the proper decoder with our fixed attention implementation
-            # This should work correctly with the dimensions
+            # Pass mask as a keyword argument to avoid conflicts
             decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(dtype=dtype)
             
             # Log what we're doing

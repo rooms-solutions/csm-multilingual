@@ -53,7 +53,16 @@ class SimpleDecoderAttention(nn.Module):
         # Add cache-related attributes for compatibility
         self.cache_enabled = False
     
-    def forward(self, x, mask=None, position_ids=None, input_pos=None):
+    def forward(self, x, *args, **kwargs):
+        # Extract parameters with precedence to named arguments
+        mask = kwargs.get('mask', None)
+        position_ids = kwargs.get('position_ids', None)
+        input_pos = kwargs.get('input_pos', None)
+        
+        # Backward compatibility for positional args
+        if len(args) >= 1 and mask is None:
+            mask = args[0]
+        
         batch_size, seq_len, _ = x.shape
         
         # Default positions if not provided
