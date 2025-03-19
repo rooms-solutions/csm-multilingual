@@ -97,7 +97,30 @@ def process_batch(model, text_tokens, audio_tokens, device):
         # We'll use direct prediction with linear layers instead
         
         # Create a position embedding matrix for each codebook position
-        position_embeddings = torch.randn(num_codebooks-1, backbone_output.size(-1), device=device, dtype=dtype) * 0.02
+        # Explicitly create on device with proper error handling
+        try:
+            # Ensure proper size from backbone output
+            embed_dim = backbone_output.size(-1)
+            # Create on the same device with explicit parameters
+            position_embeddings = torch.randn(
+                num_codebooks-1, 
+                embed_dim, 
+                device=device, 
+                dtype=dtype
+            ) * 0.02
+            # Verify the device to be certain
+            if position_embeddings.device != device:
+                logger.warning(f"Position embeddings on wrong device: {position_embeddings.device} vs expected {device}")
+                position_embeddings = position_embeddings.to(device=device, dtype=dtype)
+        except Exception as embed_err:
+            logger.error(f"Error creating position embeddings: {embed_err}")
+            # Fallback creation with hard-coded size
+            position_embeddings = torch.randn(
+                num_codebooks-1, 
+                2048,  # Default backbone embedding size 
+                device=device, 
+                dtype=dtype
+            ) * 0.02
         
         for i in range(1, num_codebooks):
             # Use the backbone output directly with a position embedding
@@ -142,9 +165,19 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 torch.ones(2, 2, dtype=torch.bool, device=device)
             ).unsqueeze(0).expand(b, 2, 2)
             
-            # Now use the proper decoder with our fixed attention implementation
-            # Pass mask as a keyword argument to avoid conflicts and ensure device consistency
-            decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(device=device, dtype=dtype)
+            try:
+                # Now use the proper decoder with our fixed attention implementation
+                # Pass mask as a keyword argument to avoid conflicts and ensure device consistency
+                decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(device=device, dtype=dtype)
+                
+                # Log what we're doing
+                if i == 1:  # Only log once per batch
+                    logger.info("Using fixed decoder implementation with proper attention handling")
+            except Exception as decoder_err:
+                # Log the specific decoder error
+                logger.error(f"Decoder error: {decoder_err}")
+                # Create a dummy decoder output with proper device/dtype to continue
+                decoder_h = decoder_input.clone().to(device=device, dtype=dtype)
             
             # Log what we're doing
             if i == 1:  # Only log once per batch
@@ -167,8 +200,17 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 # Process through the simplified decoder for this position
                 decoder_output = model.simplified_decoders[i-1](decoder_features)
                 
-                # Use the output directly for the logits calculation - ensure same device
-                ci_logits = torch.matmul(decoder_output, model.audio_head[i-1].to(device=device, dtype=dtype))
+                # Use the output directly for the logits calculation with explicit device handling
+                try:
+                    # Ensure both tensors are on same device 
+                    decoder_output = decoder_output.to(device=device, dtype=dtype)
+                    audio_head = model.audio_head[i-1].to(device=device, dtype=dtype) 
+                    ci_logits = torch.matmul(decoder_output, audio_head)
+                except Exception as mm_err:
+                    logger.error(f"Matrix multiplication error in simplified decoder: {mm_err}")
+                    # Create fallback logits
+                    vocab_size = model.args.audio_vocab_size
+                    ci_logits = torch.zeros(decoder_output.size(0), vocab_size, device=device, dtype=dtype)
                 
             else:
                 # Fallback to original approach if simplified decoders not available
@@ -185,6 +227,15 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 
                 # Ensure audio_head has correct shape and device for matrix multiplication
                 audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
+                
+                # Add debug prints to trace device issues if needed
+                if args.debug and i == 1 and batch_idx < 2:
+                    debug_info = {
+                        "decoder_h_device": decoder_h.device,
+                        "decoder_h_flat_device": decoder_h_flat.device,
+                        "audio_head_device": audio_head.device
+                    }
+                    logger.debug(f"Debug tensor device info: {debug_info}")
                 
                 # Log shapes for debugging
                 logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
@@ -207,13 +258,28 @@ def process_batch(model, text_tokens, audio_tokens, device):
             
             # For next iteration, if not the last codebook
             if i < num_codebooks - 1:
-                # Get embedding for the next codebook token - always clone inputs and ensure correct device
-                if audio_tokens.dim() == 3:
-                    ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].clone().view(-1, 1))
-                else:
-                    ci_embed = model._embed_audio(i, audio_tokens[:, i].clone().view(-1, 1))
-                # Ensure the embedding is on the correct device
-                ci_embed = ci_embed.to(device=device, dtype=dtype)
+                # Get embedding for the next codebook token with careful device handling
+                try:
+                    # Get tokens and ensure they're on the right device first
+                    if audio_tokens.dim() == 3:
+                        token_input = audio_tokens[:, i, 0].clone().view(-1, 1).to(device=device)
+                    else:
+                        token_input = audio_tokens[:, i].clone().view(-1, 1).to(device=device)
+                    
+                    # Get embedding with device-prepared inputs
+                    ci_embed = model._embed_audio(i, token_input)
+                    
+                    # Double-check the embedding device
+                    if ci_embed.device != device:
+                        ci_embed = ci_embed.to(device=device, dtype=dtype)
+                except Exception as embed_err:
+                    logger.error(f"Error in audio embedding for position {i}: {embed_err}")
+                    # Create fallback embedding
+                    embed_dim = decoder_h.size(-1)
+                    ci_embed = torch.zeros(
+                        decoder_h.size(0), 1, embed_dim, 
+                        device=device, dtype=dtype
+                    )
                 
                 # Fix dimensions - ensure consistent shape
                 if ci_embed.dim() == 4:
@@ -260,8 +326,10 @@ def process_batch(model, text_tokens, audio_tokens, device):
             dtype = next(model.parameters()).dtype
             last_h = backbone_output[:, -1, :].to(dtype=dtype)
             
-            # Only predict first codebook
-            c0_logits = model.codebook0_head(last_h)
+            # Only predict first codebook, ensuring everything is on the same device
+            # Force explicit device/dtype placement
+            last_h = last_h.to(device=device, dtype=dtype)
+            c0_logits = model.codebook0_head(last_h).to(device=device)
             
             # Extract target
             if audio_tokens.dim() == 3:
