@@ -1,9 +1,12 @@
 from dataclasses import dataclass
-
+import logging
 import torch
 import torch.nn as nn
 import torchtune
 from torchtune.models import llama3_2
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:

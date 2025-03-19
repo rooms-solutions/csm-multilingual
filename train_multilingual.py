@@ -178,9 +178,8 @@ def process_batch(model, text_tokens, audio_tokens, device):
             # Ensure audio_head has correct shape for matrix multiplication
             audio_head = model.audio_head[i-1].to(dtype=dtype)
             
-            # For debugging
-            if batch_idx == 0 and i == 1:
-                logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
+            # For debugging - remove batch_idx check since it's not available in this scope
+            logger.debug(f"decoder_h_flat shape: {decoder_h_flat.shape}, audio_head shape: {audio_head.shape}")
             
             # Perform matrix multiplication with shape checking
             if decoder_h_flat.shape[-1] != audio_head.shape[0]:
