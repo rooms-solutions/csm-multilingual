@@ -33,30 +33,19 @@ def safe_matmul(tensor1, tensor2, device):
     Perform matrix multiplication with guaranteed device compatibility.
     This function ensures both tensors are on the same device before multiplication.
     """
-    # Get the actual CUDA device if using string "cuda"
-    if isinstance(device, str) and device == "cuda":
-        if torch.cuda.is_available():
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        else:
-            device = torch.device("cpu")
+    # Normalize device to torch.device object with proper index
+    if isinstance(device, str):
+        actual_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
+    else:
+        actual_device = device
     
     # Clone tensors to avoid modifying the originals and ensure they're on the right device
-    tensor1_safe = tensor1.detach().clone().to(device=device, non_blocking=False)
-    tensor2_safe = tensor2.detach().clone().to(device=device, non_blocking=False)
+    tensor1_safe = tensor1.detach().clone().to(device=actual_device, non_blocking=False)
+    tensor2_safe = tensor2.detach().clone().to(device=actual_device, non_blocking=False)
     
     # Force synchronization
-    if tensor1_safe.device.type == "cuda" or tensor2_safe.device.type == "cuda":
-        torch.cuda.synchronize()
-    
-    # Double-check device placement
-    if tensor1_safe.device != device:
-        tensor1_safe = tensor1_safe.to(device=device, non_blocking=False)
-    if tensor2_safe.device != device:
-        tensor2_safe = tensor2_safe.to(device=device, non_blocking=False)
-    
-    # Force another synchronization
-    if tensor1_safe.device.type == "cuda" or tensor2_safe.device.type == "cuda":
-        torch.cuda.synchronize()
+    if actual_device.type == "cuda":
+        torch.cuda.synchronize(actual_device)
     
     # Perform the matrix multiplication
     return torch.matmul(tensor1_safe, tensor2_safe)
@@ -132,17 +121,15 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
         # Create a position embedding matrix for each codebook position
         # Explicitly create on device with proper error handling
         try:
-            # Get the actual CUDA device if using string "cuda"
-            cuda_device = device
-            if isinstance(device, str) and device == "cuda":
-                if torch.cuda.is_available():
-                    cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-                else:
-                    cuda_device = torch.device("cpu")
-            
+            # Ensure device is a torch.device object
+            if isinstance(device, str):
+                cuda_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
+            else:
+                cuda_device = device
+        
             # Ensure proper size from backbone output
             embed_dim = backbone_output.size(-1)
-            
+        
             # Create directly on the device with CUDA synchronization to ensure placement
             position_embeddings = torch.zeros(
                 num_codebooks-1, 
@@ -150,22 +137,16 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 device=cuda_device, 
                 dtype=dtype
             )
-            
+        
             # Fill with random values directly on device
             with torch.no_grad():
                 position_embeddings.normal_(0, 0.02)
-            
+        
             # Force synchronization
             if cuda_device.type == "cuda":
                 torch.cuda.synchronize()
-                
-            # Verify the device to be certain
-            if position_embeddings.device != cuda_device:
-                logger.warning(f"Position embeddings on wrong device: {position_embeddings.device} vs expected {cuda_device}")
-                # Force synchronous copy to device
-                position_embeddings = position_embeddings.to(device=cuda_device, dtype=dtype, non_blocking=False)
-                if cuda_device.type == "cuda":
-                    torch.cuda.synchronize()
+            
+            # No need to verify device since we created it directly on the right device
         except Exception as embed_err:
             logger.error(f"Error creating position embeddings: {embed_err}")
             # Fallback creation with hard-coded size
@@ -322,16 +303,21 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 # Ensure audio_head has correct shape and device for matrix multiplication
                 audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
             
-                # Force double-check on device before matmul to prevent errors
-                if audio_head.device != device:
-                    logger.warning(f"Audio head still on wrong device: {audio_head.device}, forcing to {device}")
-                    # Force non-blocking copy to device with synchronization
-                    audio_head = audio_head.to(device=device, dtype=dtype, non_blocking=False)
-                    torch.cuda.synchronize(device)
+                # Normalize device to device object format
+                if isinstance(device, str):
+                    actual_device = torch.device(device if device != "cuda" else f"cuda:{torch.cuda.current_device()}")
+                else:
+                    actual_device = device
+                
+                # Move tensors to device without unnecessary warnings
+                if audio_head.device != actual_device:
+                    # Force copy to device with synchronization
+                    audio_head = audio_head.to(device=actual_device, dtype=dtype, non_blocking=False)
+                    torch.cuda.synchronize(actual_device)
             
-                # Also ensure decoder_h_flat is on the correct device with synchronization
-                decoder_h_flat = decoder_h_flat.to(device=device, dtype=dtype, non_blocking=False)
-                torch.cuda.synchronize(device)
+                # Ensure decoder_h_flat is on the correct device
+                decoder_h_flat = decoder_h_flat.to(device=actual_device, dtype=dtype, non_blocking=False)
+                torch.cuda.synchronize(actual_device)
             
                 # Add debug prints to trace device issues if needed
                 if args is not None and getattr(args, 'debug', False) and i == 1 and batch_idx < 2:
