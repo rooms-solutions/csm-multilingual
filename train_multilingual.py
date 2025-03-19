@@ -26,6 +26,7 @@ from models import Model, ModelArgs, _index_causal_mask
 from moshi.models import loaders
 from multilingual_dataset import create_dataset_for_language, multilingual_collate_fn
 from language_utils import LanguageProcessor
+from custom_decoder import fix_decoder_attention
 
 # Configure logging
 logging.basicConfig(
@@ -143,16 +144,13 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 torch.ones(2, 2, dtype=torch.bool, device=device)
             ).unsqueeze(0).expand(b, 2, 2)
             
-            # COMPLETELY BYPASS THE DECODER - it's causing too many dimension issues
-            # Instead of trying to use the actual decoder, we'll just use the projection
-            # and apply a simple feed-forward network to it
-            
-            # Just apply the projection and use it directly
-            decoder_h = decoder_input
+            # Now use the proper decoder with our fixed attention implementation
+            # This should work correctly with the dimensions
+            decoder_h = model.decoder(decoder_input, input_pos=decoder_positions, mask=decoder_mask).to(dtype=dtype)
             
             # Log what we're doing
             if i == 1:  # Only log once per batch
-                logger.info("Using simplified decoder-free approach for more stable training")
+                logger.info("Using fixed decoder implementation with proper attention handling")
         
             # Ensure decoder_h has the correct dtype
             decoder_h = decoder_h.to(dtype=dtype)
@@ -367,26 +365,10 @@ def train(args):
     # Create model with bfloat16 precision
     model = Model(model_args).to(device=device, dtype=torch.bfloat16)
     
-    # Create a simplified decoder replacement - this is crucial for stable training
-    if args.simplified_decoder:
-        logger.info("Creating simplified decoder replacement for stable training")
-        decoder_dim = model.projection.out_features  # Get the decoder dimension from projection layer
-        # Create a simple MLP for each codebook that processes the projected output
-        simplified_decoders = []
-        for i in range(model.args.audio_num_codebooks - 1):
-            # This creates a separate MLP for each codebook position
-            mlp = create_simple_mlp(
-                input_dim=decoder_dim,
-                hidden_dim=decoder_dim * 2,
-                output_dim=decoder_dim,
-                device=device,
-                dtype=torch.bfloat16
-            )
-            simplified_decoders.append(mlp)
-        
-        # Add to model as a module list so it's properly saved and loaded
-        model.simplified_decoders = nn.ModuleList(simplified_decoders)
-        logger.info(f"Created {len(simplified_decoders)} simplified decoder modules")
+    # Use our custom attention module instead of simplified decoder
+    logger.info("Replacing decoder attention with fixed implementation")
+    model = fix_decoder_attention(model)
+    logger.info("Decoder attention modules replaced successfully")
     
     # Load pre-trained weights if available
     if args.checkpoint:
@@ -610,8 +592,8 @@ def main():
                         help="Patience for early stopping (0 to disable)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
-    parser.add_argument("--simplified_decoder", action="store_true",
-                        help="Use simplified decoder approach for training stability")
+    parser.add_argument("--disable_custom_decoder", action="store_true",
+                        help="Disable custom decoder implementation (not recommended)")
     
     args = parser.parse_args()
     

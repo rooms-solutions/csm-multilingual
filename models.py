@@ -116,7 +116,7 @@ class Model(nn.Module):
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
         """Setup caches and causal masks with consistent dimensions.
         
-        Ensures consistent dimensions between backbone and decoder caches.
+        With our custom decoder, we only need to set up backbone caches.
         """
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
@@ -124,11 +124,9 @@ class Model(nn.Module):
         # Force completely rebuilding caches with the current batch size
         # First try to destroy any existing caches
         try:
-            # Try to destroy existing caches by calling private methods if available
+            # Try to destroy existing backbone caches by calling private methods if available
             if hasattr(self.backbone, '_destroy_kv_cache'):
                 self.backbone._destroy_kv_cache()
-            if hasattr(self.decoder, '_destroy_kv_cache'):
-                self.decoder._destroy_kv_cache()
         except Exception:
             # If destroy fails, try to reset
             self.reset_caches()
@@ -146,32 +144,7 @@ class Model(nn.Module):
         # Store current batch size as an attribute to check later
         self._current_batch_size = max_batch_size
         
-        # Configure all layers explicitly for the given batch size
-        if hasattr(self.decoder, 'layers'):
-            for layer in self.decoder.layers:
-                if hasattr(layer, 'attn'):
-                    # Set attributes directly if possible
-                    if hasattr(layer.attn, 'max_batch_size'):
-                        layer.attn.max_batch_size = max_batch_size
-                    
-                    # Configure positional embeddings
-                    if hasattr(layer.attn, 'pos_embeddings'):
-                        if hasattr(layer.attn.pos_embeddings, 'setup'):
-                            try:
-                                # Always use seq_len=2 for decoder position embeddings
-                                layer.attn.pos_embeddings.setup(
-                                    max_batch_size=max_batch_size,
-                                    max_seq_len=2,
-                                    dtype=dtype,
-                                    device=device
-                                )
-                            except Exception as e:
-                                logger.warning(f"Failed to setup position embeddings: {e}")
-        
-        # Actually setup the backbone and decoder caches with consistent dimensions
-        # Using a more direct approach to ensure it works
-        
-        # For backbone
+        # For backbone only - we're using our custom decoder that doesn't need caching
         try:
             if hasattr(self.backbone, 'setup_caches'):
                 self.backbone.setup_caches(max_batch_size, dtype)
@@ -180,17 +153,6 @@ class Model(nn.Module):
                 self.backbone.setup_kv_cache(max_batch_size)
         except Exception as e:
             logger.warning(f"Failed to setup backbone caches: {e}")
-        
-        # For decoder - the most important part
-        try:
-            if hasattr(self.decoder, 'setup_caches'):
-                # Always use sequence length 2 for decoder
-                self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
-            # Additional check for setting up kv cache directly
-            elif hasattr(self.decoder, 'setup_kv_cache'):
-                self.decoder.setup_kv_cache(max_batch_size, max_seq_len=2)
-        except Exception as e:
-            logger.warning(f"Failed to setup decoder caches: {e}")
         
         return backbone_mask
 
@@ -236,14 +198,14 @@ class Model(nn.Module):
         curr_pos = torch.zeros((batch_size, 2), dtype=torch.long, device=curr_h.device)
         curr_pos[:, 1] = 1  # Set second position to 1
 
-        # Decoder caches must be reset every frame.
-        self.decoder.reset_caches()
+        # No need to reset decoder caches when using our fixed attention
         for i in range(1, self.args.audio_num_codebooks):
             # Create a fresh 2x2 causal mask for each iteration
             curr_decoder_mask = torch.tril(
                 torch.ones(2, 2, dtype=torch.bool, device=curr_h.device)
             ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
-            
+                
+            # Use our fixed decoder that properly handles the positions
             decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
                 dtype=dtype
             )
@@ -261,21 +223,15 @@ class Model(nn.Module):
         return curr_sample
 
     def reset_caches(self):
-        """Reset caches for both backbone and decoder.
+        """Reset caches for backbone only.
         
-        This implementation works with or without KV caching enabled.
+        Our custom decoder doesn't use caching.
         """
-        # Try to reset backbone and decoder caches if available
+        # Try to reset backbone caches if available
         # If caches are disabled, this will be a no-op
         try:
             if hasattr(self.backbone, 'reset_caches'):
                 self.backbone.reset_caches()
-        except Exception:
-            pass
-            
-        try:
-            if hasattr(self.decoder, 'reset_caches'):
-                self.decoder.reset_caches()
         except Exception:
             pass
     
