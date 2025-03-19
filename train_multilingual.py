@@ -38,15 +38,15 @@ def process_batch(model, text_tokens, audio_tokens, device):
     print(f"Debug - text_tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
     print(f"Debug - model dtype: {next(model.parameters()).dtype}")
     
-    # Create input format
+    # Create input format - use clone() to avoid in-place modifications
     b, s = text_tokens.size()
-    text_frame = torch.zeros(b, s, 33).long().to(device)
-    text_frame[:, :, -1] = text_tokens
-    text_frame_mask = torch.zeros(b, s, 33).bool().to(device)
+    text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
+    text_frame[:, :, -1] = text_tokens.clone()
+    text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
     text_frame_mask[:, :, -1] = True
     
-    # Get input positions
-    input_pos = torch.arange(s, device=device).unsqueeze(0).repeat(b, 1)
+    # Get input positions - avoid in-place repeat
+    input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
     
     # Forward pass through backbone
     embeds = model._embed_tokens(text_frame)
@@ -67,13 +67,14 @@ def process_batch(model, text_tokens, audio_tokens, device):
     num_codebooks = audio_tokens.size(1)
     total_loss = 0
     
-    # First codebook prediction using the backbone output - ensure consistent dtype
+    # First codebook prediction using the backbone output
     c0_logits = model.codebook0_head(last_h.squeeze(1).to(dtype=dtype))
-    # Extract target as 1D tensor - cross_entropy expects class indices, not multi-dimensional targets
+    
+    # Extract target as 1D tensor
     if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
-        c0_targets = audio_tokens[:, 0, 0]  # Get first token of first codebook for each batch item
+        c0_targets = audio_tokens[:, 0, 0].clone()  # Get first token of first codebook
     else:  # If shape is [batch_size, num_codebooks]
-        c0_targets = audio_tokens[:, 0]  # Get first codebook for each batch item
+        c0_targets = audio_tokens[:, 0].clone()  # Get first codebook
     
     # Make sure targets are 1D
     c0_targets = c0_targets.view(-1)
@@ -81,36 +82,41 @@ def process_batch(model, text_tokens, audio_tokens, device):
     total_loss += c0_loss
     
     # Teacher forcing for remaining codebooks
-    # Debug print to understand shapes
-    audio_embed = model._embed_audio(0, audio_tokens[:, 0, 0].view(-1, 1))
+    if audio_tokens.dim() == 3:
+        audio_embed = model._embed_audio(0, audio_tokens[:, 0, 0].clone().view(-1, 1))
+    else:
+        audio_embed = model._embed_audio(0, audio_tokens[:, 0].clone().view(-1, 1))
     
-    # Fix dimensions - ensure audio_embed matches last_h dimensions (batch_size, seq_len, hidden_dim)
+    # Fix dimensions - ensure audio_embed matches last_h dimensions
     if audio_embed.dim() == 4:  # If shape is [B, 1, 1, H]
         audio_embed = audio_embed.squeeze(2)  # Remove the extra dimension
         
-    # Concatenate along sequence dimension
+    # Concatenate along sequence dimension - create new tensor
     curr_h = torch.cat([last_h, audio_embed], dim=1)
-    curr_pos = torch.tensor([[0, 1]], device=device).repeat(b, 1)
+    # Create new position tensor without repeat (use expand)
+    curr_pos = torch.tensor([[0, 1]], device=device).expand(b, 2)
     
     # Process through decoder for subsequent codebooks
     for i in range(1, num_codebooks):
         # Use the decoder to predict next codebook
         curr_decoder_mask = _index_causal_mask(model.decoder_causal_mask, curr_pos)
-        # Ensure input to decoder is using the correct dtype
         decoder_input = model.projection(curr_h).to(dtype=dtype)
         decoder_h = model.decoder(decoder_input, input_pos=curr_pos, mask=curr_decoder_mask)
         
         # Ensure decoder_h has the correct dtype
         decoder_h = decoder_h.to(dtype=dtype)
         
-        # Get logits and targets with proper dtype consistency
-        ci_logits = torch.matmul(decoder_h[:, -1, :].unsqueeze(1), model.audio_head[i-1].to(dtype=dtype)).squeeze(1)
+        # Get logits with proper dtype consistency
+        ci_logits = torch.matmul(
+            decoder_h[:, -1, :].unsqueeze(1), 
+            model.audio_head[i-1].to(dtype=dtype)
+        ).squeeze(1)
         
-        # Extract target as 1D tensor
-        if audio_tokens.dim() == 3:  # If shape is [batch_size, num_codebooks, sequence_length]
-            ci_targets = audio_tokens[:, i, 0]  # Get first token of ith codebook for each batch item
-        else:  # If shape is [batch_size, num_codebooks]
-            ci_targets = audio_tokens[:, i]  # Get ith codebook for each batch item
+        # Extract target as 1D tensor - always clone to avoid in-place issues
+        if audio_tokens.dim() == 3:
+            ci_targets = audio_tokens[:, i, 0].clone()
+        else:
+            ci_targets = audio_tokens[:, i].clone()
             
         # Make sure targets are 1D
         ci_targets = ci_targets.view(-1)
@@ -121,16 +127,19 @@ def process_batch(model, text_tokens, audio_tokens, device):
         
         # For next iteration, if not the last codebook
         if i < num_codebooks - 1:
-            # Get embedding for the next codebook token
-            ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].view(-1, 1))
+            # Get embedding for the next codebook token - always clone inputs
+            if audio_tokens.dim() == 3:
+                ci_embed = model._embed_audio(i, audio_tokens[:, i, 0].clone().view(-1, 1))
+            else:
+                ci_embed = model._embed_audio(i, audio_tokens[:, i].clone().view(-1, 1))
             
             # Fix dimensions - ensure consistent shape
             if ci_embed.dim() == 4:
                 ci_embed = ci_embed.squeeze(2)
                 
-            # Update current hidden state and position
+            # Create new tensors instead of modifying in-place
             curr_h = ci_embed
-            curr_pos = curr_pos[:, -1:] + 1
+            curr_pos = torch.cat([curr_pos[:, :1], curr_pos[:, -1:] + 1], dim=1)
     
     return total_loss
 
@@ -158,6 +167,9 @@ def evaluate(model, val_loader, device):
     return total_val_loss / total_batches if total_batches > 0 else float('inf')
 
 def train(args):
+    # Enable anomaly detection to help identify gradient issues
+    torch.autograd.set_detect_anomaly(True)
+    
     # Set device
     device = torch.device(args.device)
     
@@ -293,13 +305,17 @@ def train(args):
             # Reset caches
             model.reset_caches()
             
+            # Make sure model caches are properly reset before each batch
+            model.reset_caches()
+            model.setup_caches(text_tokens.size(0))
+            
             # Forward pass and loss calculation
             if args.use_amp:
                 with autocast():
                     total_loss = process_batch(model, text_tokens, audio_tokens, device)
                 
                 # Optimize with mixed precision
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # More efficient
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -309,7 +325,7 @@ def train(args):
                 total_loss = process_batch(model, text_tokens, audio_tokens, device)
                 
                 # Standard optimization
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # More efficient
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
