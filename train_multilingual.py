@@ -912,6 +912,13 @@ def train(args):
                         # Replace with safe value instead of aborting
                         normalized_loss = torch.tensor(1.0, device=device, dtype=torch.float16, requires_grad=True)
                     
+                    # Check for NaN in loss before backward pass
+                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
+                        logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
+                        # Reset the loss to a stable value
+                        model_dtype = next(model.parameters()).dtype
+                        normalized_loss = torch.tensor(1.0, device=device, dtype=model_dtype, requires_grad=True)
+                    
                     # GradScaler backward pass with extra checks
                     try:
                         # Apply loss scaling and check that gradients are being computed
@@ -934,8 +941,6 @@ def train(args):
                             
                             if has_nan_grads:
                                 logger.info("Found and fixed NaN gradients during backward pass")
-                    # Check for NaN in loss before backward pass
-                    if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
                         logger.warning(f"NaN/Inf detected in loss before backward: {normalized_loss.item()}")
                         # Reset the loss to a stable value
                         model_dtype = next(model.parameters()).dtype
