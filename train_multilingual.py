@@ -99,15 +99,14 @@ def process_batch(model, text_tokens, audio_tokens, device):
     # Process through decoder for subsequent codebooks
     for i in range(1, num_codebooks):
         # Always use a consistent batch size for the decoder
-        # This is crucial to match the cached tensor dimensions
         curr_h = curr_h[:b]  # Ensure batch dimension matches original batch
         
-        # Always use fixed positions [0, 1] for decoder
-        # Create directly with the right batch dimension to avoid expand/repeat
+        # Always use fixed positions for decoder - crucial for consistency
         curr_pos = torch.zeros((b, 2), dtype=torch.long, device=device)
         curr_pos[:, 1] = 1  # Set second position to 1
         
-        # Create a fresh causal mask with the right dimensions
+        # Create a self-contained causal mask that doesn't depend on model state
+        # The causal mask must be [batch_size, seq_len, seq_len] 
         curr_decoder_mask = torch.tril(
             torch.ones(2, 2, dtype=torch.bool, device=device)
         ).unsqueeze(0).expand(b, 2, 2)
@@ -115,7 +114,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
         # Project to decoder dimension and ensure correct dtype
         decoder_input = model.projection(curr_h).to(dtype=dtype)
         
-        # Pass the manually created mask to avoid using cached masks
+        # Pass the manually created mask and position indices
         decoder_h = model.decoder(
             decoder_input, 
             input_pos=curr_pos, 
@@ -191,9 +190,7 @@ def evaluate(model, val_loader, device):
             text_tokens = batch["text_tokens"].to(device)
             audio_tokens = batch["audio_tokens"].to(device)
             
-            # Setup caches first, then reset them
-            model.setup_caches(text_tokens.size(0))
-            model.reset_caches()
+            # Caching is disabled, so no need to do anything here
             
             # Process batch
             val_loss = process_batch(model, text_tokens, audio_tokens, device)
@@ -216,6 +213,13 @@ def train(args):
     # Handle cache-related warnings
     import warnings
     warnings.filterwarnings("ignore", message="Key value caches are already setup")
+    
+    # Disable the decoder cache completely to avoid dimension issues
+    # This is necessary because the caching system has bugs with varying batch sizes
+    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        logger.info("Using native PyTorch scaled_dot_product_attention (no KV cache)")
+        # Set environment variable to disable KV caching
+        os.environ["TORCHTUNE_DISABLE_CACHE"] = "1"
     
     # Load text tokenizer
     text_tokenizer = load_llama3_tokenizer()
@@ -343,32 +347,8 @@ def train(args):
             
             # Note: audio_waveform is now a list (not tensor) and not needed for training
             
-            # Setup model caches (must be done before reset)
-            model.setup_caches(text_tokens.size(0))
-            
-            # Reset caches
-            model.reset_caches()
-            
-            # Initialize caches once at the beginning of training
-            # then just reset them for each batch to maintain consistent dimensions
-            if batch_idx == 0:
-                try:
-                    # Clear any existing caches
-                    model.reset_caches()
-                    # Set up fresh caches with current batch size
-                    model.setup_caches(text_tokens.size(0))
-                    # Mark initialization complete
-                    if not hasattr(model, '_cache_initialized'):
-                        model._cache_initialized = True
-                        logger.info(f"Cache initialized with batch size: {text_tokens.size(0)}")
-                except Exception as e:
-                    logger.warning(f"Cache setup issue: {str(e)}")
-                    # Force re-initialization in next batch
-                    if hasattr(model, '_cache_initialized'):
-                        delattr(model, '_cache_initialized')
-            else:
-                # Just reset caches for subsequent batches to reuse the same dimensions
-                model.reset_caches()
+            # We've completely disabled caching, so no need to set up or reset caches
+            # Just do nothing here - the models will work without caching
             
             # Forward pass and loss calculation
             if args.use_amp:

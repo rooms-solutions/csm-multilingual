@@ -111,35 +111,26 @@ class Model(nn.Module):
         self.audio_head = nn.Parameter(torch.empty(args.audio_num_codebooks - 1, decoder_dim, args.audio_vocab_size))
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
-        """Setup KV caches with consistent dimensions."""
-        dtype = next(self.parameters()).dtype
+        """Setup causal masks without relying on KV caching.
+        
+        This version is more robust for training when different batch sizes are used.
+        It creates self-contained masks without relying on the built-in cache system.
+        """
         device = next(self.parameters()).device
         
-        # First completely clear model caches
-        self.reset_caches()
+        # Simply create causal masks without setting up actual KV caches
+        backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
         
-        # Set up caches with explicitly controlled dimensions
-        with torch.device(device):
-            # For backbone, use the standard max_seq_len
-            backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
-            try:
-                self.backbone.setup_caches(max_batch_size, dtype)
-            except RuntimeError as e:
-                if "already setup" not in str(e):
-                    raise e
-                
-            # For decoder, ALWAYS use sequence length of 2 (crucial for avoiding dimension mismatch)
-            # This matches our fixed position indices [0, 1] during training
-            try:
-                self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=2)
-            except RuntimeError as e:
-                if "already setup" not in str(e):
-                    raise e
-
-        # Create appropriately sized masks
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(backbone_max_seq_len, device))
-        # Use a small 2x2 causal mask for decoder to match the fixed sequence length
-        self.register_buffer("decoder_causal_mask", _create_causal_mask(2, device))
+        # Just create the masks, don't set up caches
+        backbone_mask = _create_causal_mask(backbone_max_seq_len, device)
+        decoder_mask = _create_causal_mask(2, device)  # Always use size 2 for decoder
+        
+        # Register the masks as buffers
+        self.register_buffer("backbone_causal_mask", backbone_mask)
+        self.register_buffer("decoder_causal_mask", decoder_mask)
+        
+        # For backward compatibility - caches might not actually be set up
+        return backbone_mask
 
     def generate_frame(
         self,
@@ -177,9 +168,10 @@ class Model(nn.Module):
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
         
-        # Create positions [0, 1] directly with the right batch dimension
-        # This avoids inconsistencies with expand/repeat operations
-        curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=curr_h.device)
+        # Create fixed positions for the decoder
+        # Use simpler tensor creation to avoid expand/repeat operations
+        batch_size = curr_h.size(0)
+        curr_pos = torch.zeros((batch_size, 2), dtype=torch.long, device=curr_h.device)
         curr_pos[:, 1] = 1  # Set second position to 1
 
         # Decoder caches must be reset every frame.
@@ -199,29 +191,21 @@ class Model(nn.Module):
 
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            # Create a fresh position tensor with consistent dimensions
-            curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=curr_h.device)
-            curr_pos[:, 1] = 1  # Set second position to 1
+            # Maintain a consistent position tensor 
+            # Always use [0, 1] for each step
+            curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=curr_h.device) 
+            curr_pos[:, 1] = 1
 
         return curr_sample
 
     def reset_caches(self):
-        """Reset caches if they're already setup"""
-        try:
-            if hasattr(self.backbone, 'caches_are_enabled') and self.backbone.caches_are_enabled():
-                self.backbone.reset_caches()
-        except RuntimeError as e:
-            # Ignore errors about caches not being setup
-            if "not setup" not in str(e):
-                raise e
-                
-        try:
-            if hasattr(self.decoder, 'caches_are_enabled') and self.decoder.caches_are_enabled():
-                self.decoder.reset_caches()
-        except RuntimeError as e:
-            # Ignore errors about caches not being setup
-            if "not setup" not in str(e):
-                raise e
+        """No-op reset function for training without caches.
+        
+        This is kept for backward compatibility, but doesn't actually do anything
+        when KV caching is disabled.
+        """
+        # Do nothing - we're not using caches for training
+        pass
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
         return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)

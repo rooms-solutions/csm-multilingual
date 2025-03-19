@@ -108,7 +108,7 @@ def train_language(args, language):
             checkpoint = max(prev_models, key=os.path.getctime)
             logger.info(f"Using previous checkpoint for {language}: {checkpoint}")
     
-    # Run the training script
+    # Run the training script with additional flags
     cmd = [
         "python", "train_multilingual.py",
         "--language", language,
@@ -118,7 +118,8 @@ def train_language(args, language):
         "--batch_size", str(args.batch_size),
         "--learning_rate", str(args.learning_rate),
         "--num_epochs", str(args.num_epochs),
-        "--device", args.device
+        "--device", args.device,
+        "--debug"  # Always enable debug logging for better diagnostics
     ]
     
     if os.path.exists(val_csv):
