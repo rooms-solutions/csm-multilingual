@@ -319,8 +319,8 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                     mask=decoder_mask
                 ).to(device=device, dtype=dtype)
                 
-                # Log what we're doing
-                if i == 1:  # Only log once per batch
+                # Log once per batch
+                if i == 1:
                     logger.debug("Using fixed decoder implementation with proper attention handling")
             except Exception as decoder_err:
                 # Log the specific decoder error
@@ -328,9 +328,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
                 # Fall back to using the projected input directly
                 decoder_h = decoder_input.clone().to(device=device, dtype=dtype)
             
-            # Log what we're doing
-            if i == 1:  # Only log once per batch
-                logger.debug("Using fixed decoder implementation with proper attention handling")
+            # This duplicate logging was removed
         
             # Ensure decoder_h has the correct dtype
             decoder_h = decoder_h.to(dtype=dtype)
