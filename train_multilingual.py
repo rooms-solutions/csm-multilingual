@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("train_multilingual")
 
-def process_batch(model, text_tokens, audio_tokens, device):
+def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx=0):
     """Process a single batch and calculate the loss with a simplified approach"""
     # Debug prints to verify input shapes and types
     print(f"Debug - text_tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
@@ -229,7 +229,7 @@ def process_batch(model, text_tokens, audio_tokens, device):
                 audio_head = model.audio_head[i-1].to(device=device, dtype=dtype)
                 
                 # Add debug prints to trace device issues if needed
-                if args.debug and i == 1 and batch_idx < 2:
+                if args is not None and getattr(args, 'debug', False) and i == 1 and batch_idx < 2:
                     debug_info = {
                         "decoder_h_device": decoder_h.device,
                         "decoder_h_flat_device": decoder_h_flat.device,
@@ -365,7 +365,7 @@ def evaluate(model, val_loader, device):
             audio_tokens = batch["audio_tokens"].to(device)
             
             # Process batch with the same approach as training
-            val_loss = process_batch(model, text_tokens, audio_tokens, device)
+            val_loss = process_batch(model, text_tokens, audio_tokens, device, args)
             total_val_loss += val_loss.item()
             total_batches += 1
     
@@ -550,7 +550,7 @@ def train(args):
             # Forward pass and loss calculation
             if args.use_amp:
                 with autocast():
-                    total_loss = process_batch(model, text_tokens, audio_tokens, device)
+                    total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
                 
                 # Optimize with mixed precision
                 optimizer.zero_grad(set_to_none=True)  # More efficient
@@ -560,7 +560,7 @@ def train(args):
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                total_loss = process_batch(model, text_tokens, audio_tokens, device)
+                total_loss = process_batch(model, text_tokens, audio_tokens, device, args, batch_idx)
                 
                 # Standard optimization
                 optimizer.zero_grad(set_to_none=True)  # More efficient
