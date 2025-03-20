@@ -260,6 +260,27 @@ class Generator:
         "upsample.convtr": (64, 32),
       }
 
+      # Helper function to identify transposed convolutions
+      def is_transposed_conv(module, name):
+          """Check if a module is a transposed convolution or behaves like one"""
+          # Direct class check
+          if isinstance(module, torch.nn.ConvTranspose1d):
+              return True
+              
+          # Name-based heuristics
+          if 'convtr' in name.lower() or 'transpose' in name.lower():
+              return True
+              
+          # Weight shape check - transposed convs typically have weight with in_channels first
+          if hasattr(module, 'weight') and len(module.weight.shape) == 3:
+              weight = module.weight
+              # ConvTranspose1d has weight [in_channels, out_channels, kernel]
+              # If in_channels > out_channels, likely a transposed conv
+              if weight.shape[0] > weight.shape[1]:
+                  return True
+                  
+          return False
+      
       # Apply the patch to various components in the Mimi model
       try:
         # Patch primary upsampling method if available
@@ -293,38 +314,115 @@ class Generator:
             original_forward = module.forward
 
             def make_patched_forward(mod_name, channel_info):
-              # Store original forward method
+              # Store original forward method and check if this is a transposed convolution
               original_forward = module.forward
+              is_transposed = isinstance(module, torch.nn.ConvTranspose1d) or ".convtr" in mod_name
+              
+              # Extract actual weight dimensions for transposed convolutions
+              if is_transposed and hasattr(module, 'weight'):
+                  weight_shape = module.weight.shape
+                  # For transposed conv: weight is [in_channels, out_channels, kernel]
+                  in_channels, out_channels, kernel_size = weight_shape
+                  stride = getattr(module, 'stride', (1,))[0]
+                  padding = getattr(module, 'padding', (0,))[0]
+                  output_padding = getattr(module, 'output_padding', (0,))[0]
+              elif channel_info is not None:
+                  in_channels, out_channels = channel_info
+              else:
+                  in_channels, out_channels = None, None
 
               def patched_forward(self, x):
                 print(f"Intercepted problematic convtr in {mod_name}")
+                
+                batch_size, current_channels, seq_len = x.shape
+                
+                # Special handling for transposed convolutions
+                if is_transposed and hasattr(module, 'weight'):
+                    # For transposed conv, we need to EXPAND channels (opposite of normal conv)
+                    if current_channels != in_channels:
+                        print(f"Transposed conv channel mismatch: input has {current_channels}, need {in_channels}")
+                        
+                        if current_channels == out_channels:
+                            # Input has the output channel count, need to expand to in_channels
+                            # Create a channel expansion matrix for proper upsampling
+                            expansion_factor = in_channels // current_channels
+                            if expansion_factor > 1:
+                                # Create a learned-like expansion that distributes evenly
+                                expanded = torch.zeros(batch_size, in_channels, seq_len, 
+                                                      device=x.device, dtype=x.dtype)
+                                
+                                # Duplicate each channel multiple times with slight variations
+                                for i in range(current_channels):
+                                    for j in range(expansion_factor):
+                                        factor = 1.0 - 0.01 * j  # Slight variation to avoid exact duplication
+                                        expanded[:, i*expansion_factor + j, :] = x[:, i, :] * factor
+                                
+                                x = expanded
+                                print(f"Expanded channels: {current_channels} → {in_channels}")
+                
+                # For regular convolutions - normal dimension reduction
+                elif channel_info is not None and not is_transposed:
+                    input_channels, expected_channels = channel_info
+                    current_channels = x.size(1)
 
-                # Check if we need to fix channel dimensions
-                if channel_info is not None:
-                  input_channels, expected_channels = channel_info
-                  current_channels = x.size(1)
-
-                  # Only apply the fix if we have the specific mismatch
-                  if current_channels == input_channels and input_channels != expected_channels:
-                    # Calculate the reduction factor
-                    reduction_factor = input_channels // expected_channels
-                    if reduction_factor > 1:
-                      batch_size, channels, seq_len = x.shape
-                      # Reshape and average groups of channels
-                      x = x.reshape(batch_size, expected_channels,
-                                    reduction_factor, seq_len)
-                      x = x.mean(dim=2)
-                      print(f"Fixed channel dimension: {x.shape}")
+                    # Only apply the fix if we have the specific mismatch
+                    if current_channels == input_channels and input_channels != expected_channels:
+                        # Calculate the reduction factor
+                        reduction_factor = input_channels // expected_channels
+                        if reduction_factor > 1:
+                            batch_size, channels, seq_len = x.shape
+                            # Reshape and average groups of channels
+                            x = x.reshape(batch_size, expected_channels,
+                                        reduction_factor, seq_len)
+                            x = x.mean(dim=2)
+                            print(f"Fixed channel dimension: {x.shape}")
                 
                 # Try original forward first
                 try:
-                  # Ensure tensor is contiguous and has correct dtype
-                  x = x.contiguous().to(dtype=torch.float32)
-                  return original_forward(x)
+                    # Ensure tensor is contiguous and has correct dtype
+                    x = x.contiguous().to(dtype=torch.float32)
+                    return original_forward(x)
                 except Exception as e:
-                  print(f"Original convtr failed: {e}, using custom upsampling")
-                  # Fall back to custom upsampling
-                  return custom_upsample(x)
+                    print(f"Original convtr failed: {e}, using custom upsampling")
+                    
+                    # Better fallback for transposed convolutions
+                    if is_transposed and hasattr(module, 'weight'):
+                        try:
+                            # First upsample by the stride factor
+                            x_up = torch.nn.functional.interpolate(
+                                x, scale_factor=stride, mode='linear', align_corners=False
+                            )
+                            
+                            # Then apply a regular convolution as an approximation
+                            if hasattr(module, 'weight'):
+                                # Create a simpler weight that preserves some structure
+                                # Using a low-pass filter approximation
+                                kernel_width = min(kernel_size, 5)  # Simpler kernel
+                                simple_weight = torch.zeros(
+                                    out_channels, in_channels, kernel_width, 
+                                    device=x.device, dtype=torch.float32
+                                )
+                                
+                                # Fill with a triangular filter
+                                for i in range(kernel_width):
+                                    val = 1.0 - abs(i - kernel_width/2) / (kernel_width/2)
+                                    simple_weight[:, :, i] = val
+                                
+                                # Normalize weights
+                                simple_weight = simple_weight / simple_weight.sum(dim=2, keepdim=True)
+                                
+                                # Apply convolution with padding to preserve dimensions
+                                padding_val = kernel_width // 2
+                                result = torch.nn.functional.conv1d(
+                                    x_up, simple_weight, stride=1, padding=padding_val
+                                )
+                                
+                                return result
+                        except Exception as adv_e:
+                            print(f"Advanced fallback failed: {adv_e}")
+                    
+                    # Standard fallback - simple upsampling
+                    return custom_upsample(x)
 
               return patched_forward
 
