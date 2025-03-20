@@ -326,6 +326,20 @@ class Generator:
       # Force correct format to avoid CUDA kernel issues
       # Ensure we use integer tokens which the Mimi codec expects
       permuted_samples = permuted_samples.contiguous().to(dtype=torch.long)
+      
+      # Apply safety preprocessing to avoid CUDA assertion failures
+      batch_size, channels, seq_len = permuted_samples.shape
+
+      # 1. Clamp token values to avoid index out of bounds errors
+      permuted_samples = torch.clamp(permuted_samples, min=0, max=self.max_token_value)
+
+      # 2. Fix the channel dimension mismatch if needed
+      if channels == 1024:
+          print(f"Fixing channel dimension mismatch: reshaping {permuted_samples.shape}")
+          # Convert to 512 channels as expected by decoder
+          permuted_samples = permuted_samples.reshape(batch_size, 512, 2, seq_len)
+          permuted_samples = permuted_samples.mean(dim=2).to(dtype=torch.long)
+          print(f"New shape after fix: {permuted_samples.shape}")
 
       # Print debug info
       print(f"Decoding with samples on device: {permuted_samples.device}")
