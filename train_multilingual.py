@@ -341,6 +341,65 @@ def train(args):
         logger.info("Decoder attention modules replaced successfully")
         logger.info(f"Verified model is on device: {next(model.parameters()).device}")
     
+    # Load CSM-1B pretrained model if requested
+    if args.use_csm_pretrained:
+        try:
+            from huggingface_hub import hf_hub_download
+            logger.info("Downloading CSM-1B pretrained model...")
+            model_path = hf_hub_download("SesameAILabs/CSM-1B", "ckpt.pt")
+            logger.info(f"Loading CSM-1B model from {model_path}")
+            
+            # Load pretrained state dict
+            csm_state_dict = torch.load(model_path, map_location=device)
+            
+            # Load weights, potentially with adaptation
+            model_dict = model.state_dict()
+            
+            # Get parameter shapes for logging
+            shape_mismatches = 0
+            matching_params = 0
+            
+            # Create pretrained dict, handling shape mismatches
+            pretrained_dict = {}
+            for k, v in csm_state_dict.items():
+                if k in model_dict:
+                    if model_dict[k].shape == v.shape:
+                        pretrained_dict[k] = v
+                        matching_params += 1
+                    else:
+                        shape_mismatches += 1
+                        logger.debug(f"Shape mismatch for {k}: pretrained {v.shape} vs model {model_dict[k].shape}")
+            
+            # Update model with pretrained weights
+            logger.info(f"Loading {matching_params}/{len(model_dict)} layers from CSM-1B")
+            logger.info(f"Skipped {shape_mismatches} layers due to shape mismatches")
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
+            
+            # Freeze backbone if requested
+            if args.freeze_backbone:
+                logger.info("Freezing backbone parameters to preserve CSM-1B capabilities")
+                for name, param in model.backbone.named_parameters():
+                    param.requires_grad = False
+                    
+                # Count frozen vs trainable parameters
+                total_params = sum(p.numel() for p in model.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
+            
+            logger.info("Successfully initialized from CSM-1B model")
+            
+            # Adjust learning rate for fine-tuning if not explicitly set
+            if not args.preserve_learning_rate and args.freeze_backbone:
+                original_lr = args.learning_rate
+                args.learning_rate = min(original_lr, 2e-5)  # Use lower LR for fine-tuning
+                logger.info(f"Adjusted learning rate for fine-tuning: {original_lr} -> {args.learning_rate}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to load CSM pretrained model: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
     # Load pre-trained weights if available
     if args.checkpoint:
         try:
