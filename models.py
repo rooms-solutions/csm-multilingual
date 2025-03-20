@@ -132,9 +132,9 @@ class Model(nn.Module):
         # Always use size 2 for decoder to ensure consistent dimensions
         decoder_mask = _create_causal_mask(2, device) 
         
-        # Register the masks as buffers
-        self.register_buffer("backbone_causal_mask", backbone_mask)
-        self.register_buffer("decoder_causal_mask", decoder_mask)
+        # Use persistent=True to ensure buffers are saved with state_dict
+        self.register_buffer("backbone_causal_mask", backbone_mask, persistent=True)
+        self.register_buffer("decoder_causal_mask", decoder_mask, persistent=True)
         
         # Store current batch size as an attribute to check later
         self._current_batch_size = max_batch_size
@@ -147,7 +147,7 @@ class Model(nn.Module):
             elif hasattr(self.backbone, 'setup_kv_cache'):
                 self.backbone.setup_kv_cache(max_batch_size)
         except Exception as e:
-            print(f"Note: Using simplified caching mechanism")
+            print(f"Note: Using simplified caching mechanism: {e}")
         
         return backbone_mask
 
