@@ -41,21 +41,31 @@ class Generator:
         self,
         model: Model,
     ):
+        # Get and store device
+        self.device = next(model.parameters()).device
+        print(f"Generator initialized on device: {self.device}")
+        
         self._model = model
         self._model.setup_caches(1)
 
         self._text_tokenizer = load_llama3_tokenizer()
 
-        device = next(model.parameters()).device
+        # Make sure all components are on the same device
         mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
-        mimi = loaders.get_mimi(mimi_weight, device=device)
+        mimi = loaders.get_mimi(mimi_weight, device=self.device)
         mimi.set_num_codebooks(32)
         self._audio_tokenizer = mimi
 
-        self._watermarker = load_watermarker(device=device)
+        self._watermarker = load_watermarker(device=self.device)
+        
+        # Additional safety check to make sure watermarker is on the right device
+        for param in self._watermarker.parameters():
+            if param.device != self.device:
+                print(f"Warning: Moving watermarker from {param.device} to {self.device}")
+                self._watermarker = self._watermarker.to(self.device)
+                break
 
         self.sample_rate = mimi.sample_rate
-        self.device = device
 
     def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
         frame_tokens = []
@@ -113,6 +123,10 @@ class Generator:
         temperature: float = 0.9,
         topk: int = 50,
     ) -> torch.Tensor:
+        # Get device from model
+        device = self.device
+        
+        # Reset caches
         self._model.reset_caches()
 
         max_audio_frames = int(max_audio_length_ms / 80)
@@ -126,13 +140,14 @@ class Generator:
         tokens.append(gen_segment_tokens)
         tokens_mask.append(gen_segment_tokens_mask)
 
-        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
-        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+        # Ensure all tensors are on the correct device
+        prompt_tokens = torch.cat(tokens, dim=0).long().to(device)
+        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(device)
 
         samples = []
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
-        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+        curr_pos = torch.arange(0, prompt_tokens.size(0), device=device).unsqueeze(0).long()
 
         max_seq_len = 2048 - max_audio_frames
         if curr_tokens.size(1) >= max_seq_len:
@@ -151,13 +166,16 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-        audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+        # Stack samples and decode
+        device = self.device
+        stacked_samples = torch.stack(samples).to(device)
+        audio = self._audio_tokenizer.decode(stacked_samples.permute(1, 2, 0)).squeeze(0).squeeze(0)
 
         # This applies an imperceptible watermark to identify audio as AI-generated.
         # Watermarking ensures transparency, dissuades misuse, and enables traceability.
         # Please be a responsible AI citizen and keep the watermarking in place.
         # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
+        audio, wm_sample_rate = watermark(self._watermarker, audio.to(device), self.sample_rate, CSM_1B_GH_WATERMARK)
         audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
 
         return audio
@@ -181,6 +199,10 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
 
 def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
     """Load a multilingual model with compatibility for custom decoder attention"""
+    # Ensure device is a torch.device object
+    if isinstance(device, str):
+        device = torch.device(device)
+    
     model_args = ModelArgs(
         backbone_flavor="llama-1B",
         decoder_flavor="llama-100M",
@@ -202,6 +224,9 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
     # Try loading with strict=False to ignore missing/unexpected keys
     model.load_state_dict(state_dict, strict=False)
     print("Model loaded with adjusted decoder attention architecture")
+    
+    # Make sure everything is on the correct device
+    model = model.to(device)
     
     generator = Generator(model)
     return generator

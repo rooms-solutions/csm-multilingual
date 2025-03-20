@@ -32,6 +32,11 @@ def watermark(
     sample_rate: int,
     watermark_key: list[int],
 ) -> tuple[torch.Tensor, int]:
+    # Ensure audio is on the same device as watermarker
+    device = next(watermarker.parameters()).device
+    audio_array = audio_array.to(device)
+    
+    # Resample to 44.1kHz on the same device
     audio_array_44khz = torchaudio.functional.resample(audio_array, orig_freq=sample_rate, new_freq=44100)
     encoded, _ = watermarker.encode_wav(audio_array_44khz, 44100, watermark_key, calc_sdr=False, message_sdr=36)
 

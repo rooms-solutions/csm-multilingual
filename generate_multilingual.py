@@ -85,6 +85,10 @@ def generate_audio(
     processed_text = language_processor.preprocess_text(text)
     print(f"Processing text [{language_code}]: {processed_text}")
     
+    # Ensure device consistency
+    device = generator.device
+    print(f"Using device for generation: {device}")
+    
     # Generate audio
     audio = generator.generate(
         text=processed_text,
