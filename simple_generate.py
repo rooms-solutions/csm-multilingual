@@ -191,8 +191,8 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                         temperature=0.9,
                         topk=50
                     )
-                    # Verify frame device
-                    if frame.device != device_obj:
+                    # Verify frame device - compare device types rather than exact strings
+                    if str(frame.device).split(':')[0] != str(device_obj).split(':')[0]:
                         logger.warning(f"Device mismatch after generate_frame: expected {device_obj}, got {frame.device}")
                         frame = frame.to(device_obj, non_blocking=False)
                 except RuntimeError as e:
@@ -227,9 +227,10 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                 raise ValueError("No audio frames were generated!")
                 
             # Ensure all samples are on the same device before stacking
+            # Only consider actual different device types (cuda vs cpu), not just cuda:0 vs cuda
             device_mismatch = False
             for i, sample in enumerate(samples):
-                if sample.device != device_obj:
+                if str(sample.device).split(':')[0] != str(device_obj).split(':')[0]:
                     logger.warning(f"Sample {i} device mismatch: {sample.device} vs {device_obj}")
                     samples[i] = sample.to(device_obj, non_blocking=False)
                     device_mismatch = True

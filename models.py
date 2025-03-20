@@ -248,11 +248,20 @@ class Model(nn.Module):
         # Debug info
         print(f"Parameter device: {param_device}, Input device: {tokens.device}")
         
-        # Force all inputs to the parameter device for consistency
+        # Ignore device mismatch when it's just "cuda" vs "cuda:0" etc.
+        # as long as they're both on the same type of device (cuda or cpu)
+        inputs_on_correct_type = (
+            str(tokens.device).split(':')[0] == str(param_device).split(':')[0] and
+            str(tokens_mask.device).split(':')[0] == str(param_device).split(':')[0] and
+            str(input_pos.device).split(':')[0] == str(param_device).split(':')[0]
+        )
+        
+        # Force all inputs to the parameter device for consistency only if truly needed
         device = param_device
-        tokens = tokens.to(device, non_blocking=False)
-        tokens_mask = tokens_mask.to(device, non_blocking=False)
-        input_pos = input_pos.to(device, non_blocking=False)
+        if not inputs_on_correct_type:
+            tokens = tokens.to(device, non_blocking=False)
+            tokens_mask = tokens_mask.to(device, non_blocking=False)
+            input_pos = input_pos.to(device, non_blocking=False)
         
         # Force synchronization to ensure device transfers are complete
         if device.type == "cuda":
@@ -349,7 +358,7 @@ class Model(nn.Module):
             curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=device) 
             curr_pos[:, 1] = 1
             
-        # Final device check
+        # Final device check - don't warn about "cuda" vs "cuda:0"
         curr_sample = curr_sample.to(device)
         print(f"Generated frame output device: {curr_sample.device}")
         return curr_sample
