@@ -193,7 +193,7 @@ class Generator:
       """Patch Mimi model's upsampling to avoid CUDA compatibility issues"""
 
       # Define custom upsampling that stays on CUDA but avoids transpose conv issues
-      def custom_upsample(x):
+      def custom_upsample(x, scale_factor=2):
         """Custom upsampling that uses interpolate instead of conv_transpose1d"""
         # Force correct format and contiguity
         x = x.contiguous().to(dtype=torch.float32)
@@ -205,28 +205,47 @@ class Generator:
         try:
           # Use recommended interpolation with fewer artifacts
           result = torch.nn.functional.interpolate(
-              x, scale_factor=2, mode='linear', align_corners=False
+              x, scale_factor=scale_factor, mode='linear', align_corners=False
           )
           
-          # Apply a light smoothing to reduce artifacts
-          if channels <= 512:  # Only for manageable channel counts
-            kernel_size = min(5, seq_len // 10)
+          # Use different smoothing approaches depending on channel count
+          if channels <= 512:  # For manageable channel counts
+            # More sophisticated smoothing with learned-like filtering
+            kernel_size = min(7, seq_len // 8)
             if kernel_size % 2 == 0:  # Ensure odd kernel size
               kernel_size += 1
+              
             if kernel_size > 1:
               padding = kernel_size // 2
-              # Create simple 1D smoothing filter
-              weight = torch.ones(channels, 1, kernel_size, device=x.device) / kernel_size
+              
+              # Create a smoothing filter that better preserves audio characteristics
+              # Use a Hann window for better frequency response
+              window = torch.hann_window(kernel_size, device=x.device).reshape(1, 1, kernel_size)
+              weight = window.repeat(channels, 1, 1)
+              weight = weight / weight.sum(dim=2, keepdim=True)  # Normalize
+              
+              # Apply filter with grouped convolution for efficiency
               result = torch.nn.functional.conv1d(
                   result, weight, padding=padding, groups=channels
               )
+          
+          # For high channel counts, use simpler method
+          elif channels > 512:
+            # Use a simpler filter for very high-dimensional data
+            kernel_size = 3
+            padding = 1
+            weight = torch.ones(channels, 1, kernel_size, device=x.device) / kernel_size
+            result = torch.nn.functional.conv1d(
+                result, weight, padding=padding, groups=channels
+            )
+            
         except RuntimeError as e:
           # Most basic fallback for any errors
           print(f"Enhanced upsampling failed: {e}, using basic method")
-          # Create a simple 2x upsampled tensor via reshape + repeat
+          # Create a simple upsampled tensor via reshape + repeat
           x_flat = x.reshape(batch_size * channels, 1, seq_len)
-          result = x_flat.repeat_interleave(2, dim=2)
-          result = result.reshape(batch_size, channels, seq_len * 2)
+          result = x_flat.repeat_interleave(scale_factor, dim=2)
+          result = result.reshape(batch_size, channels, seq_len * scale_factor)
           
         return result
 
