@@ -506,8 +506,8 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                     audio = mimi.decode(stacked_samples)
                     logger.info(f"Audio decoded successfully, device: {audio.device}")
                 except Exception as e:
-                error_msg = str(e)
-                logger.warning(f"First decode attempt failed: {error_msg}")
+                    error_msg = str(e)
+                    logger.warning(f"First decode attempt failed: {error_msg}")
                 
                 # Fallback 1: Try to directly run the components of the decode function
                 try:
