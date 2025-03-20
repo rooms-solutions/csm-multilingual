@@ -55,40 +55,15 @@ class Generator:
     mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
     mimi = loaders.get_mimi(mimi_weight, device=self.device)
     mimi.set_num_codebooks(32)
-    self._audio_tokenizer = mimi
+
+    # Wrap the mimi codec in our safe wrapper
+    self._audio_tokenizer = create_safe_mimi_wrapper(mimi, device=self.device)
 
     # Store maximum token value for safety checks during decoding
     if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
         self.max_token_value = mimi.vq.codebook_size - 1
     else:
         self.max_token_value = 2048  # Safe default
-
-    self._watermarker = load_watermarker(device=self.device)
-
-    # No need for parameter check as we've made load_watermarker robust
-
-    self.sample_rate = mimi.sample_rate
-
-  def __init__(
-      self,
-      model: Model,
-  ):
-    # Get and store device
-    self.device = next(model.parameters()).device
-    print(f"Generator initialized on device: {self.device}")
-
-    self._model = model
-    self._model.setup_caches(1)
-
-    self._text_tokenizer = load_llama3_tokenizer()
-
-    # Make sure all components are on the same device
-    mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
-    mimi = loaders.get_mimi(mimi_weight, device=self.device)
-    mimi.set_num_codebooks(32)
-
-    # Wrap the mimi codec in our safe wrapper
-    self._audio_tokenizer = create_safe_mimi_wrapper(mimi, device=self.device)
 
     self._watermarker = load_watermarker(device=self.device)
 
@@ -331,7 +306,8 @@ class Generator:
       batch_size, channels, seq_len = permuted_samples.shape
 
       # 1. Clamp token values to avoid index out of bounds errors
-      permuted_samples = torch.clamp(permuted_samples, min=0, max=self.max_token_value)
+      max_token = getattr(self._audio_tokenizer, 'max_token', self.max_token_value)
+      permuted_samples = torch.clamp(permuted_samples, min=0, max=max_token)
 
       # 2. Fix the channel dimension mismatch if needed
       if channels == 1024:
