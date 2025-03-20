@@ -65,163 +65,57 @@ logging.basicConfig(
 logger = logging.getLogger("train_multilingual")
 
 def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx=0):
-    """Process a single batch and calculate the loss with a simplified approach"""
-    # Debug info using logger
-    logger.debug(f"Text tokens shape: {text_tokens.shape}, audio_tokens shape: {audio_tokens.shape}")
-
-    # Create input format
+    """Process a single batch with minimal modifications from CSM approach"""
+    
+    # Create input format - use standard CSM approach
     b, s = text_tokens.size()
     text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
     text_frame[:, :, -1] = text_tokens
     text_frame_mask = torch.zeros(b, s, 33, dtype=torch.bool, device=device)
     text_frame_mask[:, :, -1] = True
 
-    # Get input positions
+    # Get input positions (standard approach)
     input_pos = torch.arange(s, device=device).unsqueeze(0).expand(b, s)
     
-    # Forward pass through backbone
+    # Forward pass through backbone (unchanged from CSM)
     embeds = model._embed_tokens(text_frame)
     masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
     h = masked_embeds.sum(dim=2)
 
-    # Create backbone causal mask
-    seq_len = text_tokens.size(1)
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-    curr_backbone_mask = causal_mask.unsqueeze(0).expand(b, seq_len, seq_len)
+    # Create causal mask (standard implementation)
+    causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
+    curr_backbone_mask = _index_causal_mask(causal_mask, input_pos)
+    
+    # Run backbone
     backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
     
-    # Get model's dtype for consistent operations
-    dtype = next(model.parameters()).dtype
-    backbone_output = backbone_output.to(dtype=dtype)
-    
-    # Last hidden state for each sequence
-    last_h = backbone_output[:, -1, :].unsqueeze(1)  # [B, 1, D]
-    
-    # Codebook predictions and loss calculation
+    # Compute loss for all codebooks
     num_codebooks = audio_tokens.size(1)
     total_loss = 0
-
-    # First codebook prediction
-    c0_logits = model.codebook0_head(last_h.squeeze(1))
     
-    # Extract target
-    if audio_tokens.dim() == 3:
-        c0_targets = audio_tokens[:, 0, 0]
-    else:
-        c0_targets = audio_tokens[:, 0]
-    c0_targets = c0_targets.view(-1)
-    
-    # Calculate first codebook loss
-    c0_loss = numerically_stable_cross_entropy(c0_logits, c0_targets)
-    total_loss += c0_loss
-    
-    # Position embeddings for remaining codebooks
-    position_embeddings = torch.zeros(
-        num_codebooks-1, 
-        backbone_output.size(-1), 
-        device=device, 
-        dtype=dtype
-    )
-    
-    # Initialize with small random values
-    with torch.no_grad():
-        position_embeddings.normal_(0, 0.02)
-        
-    for i in range(1, num_codebooks):
-        # Use backbone output with position embedding
-        pos_idx = i - 1
-        
-        # Add position embedding
-        codebook_h = last_h.squeeze(1) + position_embeddings[pos_idx]
-        
-        # Project to decoder dimension
-        projected_h = model.projection(codebook_h.unsqueeze(1))
-        
-        # Get logits
-        ci_logits = torch.matmul(projected_h.squeeze(1), model.audio_head[i-1])
-        
-        # Extract target
-        if audio_tokens.dim() == 3:
-            ci_targets = audio_tokens[:, i, 0]
+    # Simplified codebook prediction - more like original CSM
+    for i in range(num_codebooks):
+        if i == 0:
+            # First codebook prediction directly from backbone
+            logits = model.codebook0_head(backbone_output[:, -1, :])
         else:
-            ci_targets = audio_tokens[:, i]
-        ci_targets = ci_targets.view(-1)
-        
-        # Calculate loss
-        ci_loss = numerically_stable_cross_entropy(ci_logits, ci_targets)
-        total_loss += ci_loss
-        
-        # Process with decoder - ensure we have the expected sequence length of 2
-        decoder_input_single = model.projection(codebook_h.unsqueeze(1))
-        # Create a tensor of shape [batch_size, 2, dim] with consistent dimensions
-        batch_size = decoder_input_single.size(0)
-        dim = decoder_input_single.size(2)
-        decoder_input = torch.cat([
-            decoder_input_single,
-            torch.zeros(batch_size, 1, dim, device=decoder_input_single.device, dtype=decoder_input_single.dtype)
-        ], dim=1)
-            
-        # Fixed positions for decoder
-        decoder_positions = torch.zeros(b, 2, dtype=torch.long, device=device)
-        decoder_positions[:, 1] = 1
-        
-        # Simple decoder mask
-        decoder_mask = torch.tril(
-            torch.ones(2, 2, dtype=torch.bool, device=device)
-        ).unsqueeze(0).expand(b, 2, 2)
-        
-        # Call decoder
-        try:
-            decoder_h = model.decoder(
-                decoder_input,
-                input_pos=decoder_positions,
-                mask=decoder_mask
+            # Subsequent codebooks through projection and decoder
+            logits = torch.matmul(
+                model.projection(backbone_output[:, -1, :].unsqueeze(1)).squeeze(1), 
+                model.audio_head[i-1]
             )
-            
-            # Get last hidden state
-            decoder_h_flat = decoder_h[:, -1, :]
-            
-            # Second prediction of same codebook
-            ci_logits = torch.matmul(decoder_h_flat, model.audio_head[i-1])
-            ci_loss = nn.functional.cross_entropy(ci_logits, ci_targets)
-            total_loss += ci_loss
-        except Exception as e:
-            # On decoder error, just log it
-            logger.debug(f"Using simplified path for codebook {i}: {e}")
-            # We already calculated loss with projected_h above, so no need to add again
         
-        # For next iteration, if not the last codebook
-        if i < num_codebooks - 1:
-            # Get embedding for next codebook token with explicit device control
-            if audio_tokens.dim() == 3:
-                token_input = audio_tokens[:, i, 0].view(-1, 1)
-            else:
-                token_input = audio_tokens[:, i].view(-1, 1)
-            
-            # Ensure token is on the correct device
-            token_input = token_input.to(device=device, non_blocking=False)
-            
-            # Synchronize before embedding
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-                
-            ci_embed = model._embed_audio(i, token_input)
-            
-            # Ensure consistent shape
-            if ci_embed.dim() == 4:
-                ci_embed = ci_embed.squeeze(2)
-                
-            # Verify device consistency
-            ci_embed = ci_embed.to(device=device, non_blocking=False)
-    
-    # Normalize the loss
-    normalized_loss = total_loss / num_codebooks
+        # Get target and compute loss
+        target = audio_tokens[:, i].view(-1)
+        loss = torch.nn.functional.cross_entropy(logits, target)
+        total_loss += loss
     
     # Log occasionally
     if batch_idx % 100 == 0:
-        logger.info(f"Avg codebook loss: {normalized_loss.item():.4f}")
+        logger.info(f"Avg codebook loss: {(total_loss / num_codebooks).item():.4f}")
     
-    return normalized_loss
+    # Normalize loss
+    return total_loss / num_codebooks
 
 # Remove the reinitialize_caches function - we're not using caches at all
 

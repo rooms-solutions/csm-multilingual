@@ -153,11 +153,12 @@ class MultilingualVoiceDataset(Dataset):
             waveform_tensor = waveform.unsqueeze(0).unsqueeze(0).to(device)
             audio_tokens = self.mimi.encode(waveform_tensor)[0]
             
-            # Verify token range is reasonable (for debugging)
-            if idx % 100 == 0:  # Log only occasionally to avoid spam
+            # Verify token range periodically (helps catch issues early)
+            if idx % 100 == 0:
                 token_min = audio_tokens.min().item()
                 token_max = audio_tokens.max().item()
                 token_mean = audio_tokens.float().mean().item()
+                print(f"Audio tokens range: min={token_min}, max={token_max}, mean={token_mean:.2f}")
 
                 # Validate by decoding and re-encoding a sample
                 if idx == 0:

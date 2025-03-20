@@ -564,117 +564,38 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
 
 
 def create_safe_mimi_wrapper(original_mimi, device="cuda"):
-  """Create a safe wrapper around Mimi codec to prevent CUDA errors"""
-
-  # Create a class that wraps the Mimi codec
-  class SafeMimiWrapper:
-    def __init__(self, orig_mimi, device):
-      self.mimi = orig_mimi
+  """Create a minimal wrapper that preserves CSM functionality"""
+  
+  class MinimalMimiWrapper:
+    def __init__(self, mimi, device):
+      self.mimi = mimi
       self.device = device
-      # Get the maximum valid token index from the Mimi model
-      if hasattr(self.mimi, 'vq') and hasattr(self.mimi.vq, 'codebook_size'):
-        self.max_token = self.mimi.vq.codebook_size - 1
+      # Get max token value (needed for safety)
+      if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
+        self.max_token = mimi.vq.codebook_size - 1
       else:
-        # Conservative fallback
         self.max_token = 2000
-      print(f"Safe Mimi wrapper created with max token value: {self.max_token}")
-    
+          
     def named_modules(self):
-      """Pass through named_modules calls to the wrapped mimi model"""
-      if hasattr(self.mimi, 'named_modules'):
-        return self.mimi.named_modules()
-      return []
-      
-    def parameters(self):
-      """Pass through parameters calls to the wrapped mimi model"""
-      return self.mimi.parameters()
-
-    def encode(self, audio):
-      """Pass through to original encoder"""
-      return self.mimi.encode(audio)
-
-    def decode(self, tokens):
-      """Safe decoding that preprocesses tokens to avoid CUDA errors"""
-      # Move to CPU for safe preprocessing
-      tokens_cpu = tokens.detach().cpu()
-
-      # Get token shape
-      batch_size, channels, seq_len = tokens_cpu.shape
-
-      # 1. Clamp token values to valid range
-      safe_tokens = torch.clamp(tokens_cpu, min=0, max=self.max_token)
-
-      # 2. Handle channel dimension mismatches
-      if channels == 1024:
-        # If we have the 1024 vs 512 channel mismatch, fix it
-        print(f"Fixing channel dimension: reshaping {channels} -> 512")
-        safe_tokens = safe_tokens.reshape(batch_size, 512, 2, seq_len)
-        safe_tokens = safe_tokens.mean(dim=2).to(torch.long)
-        channels = 512
-
-      # Move tokens back to device for decoding
-      safe_tokens = safe_tokens.to(self.device)
-
-      # IMPORTANT CHANGE: Try original Mimi decoder FIRST
-      try:
-        print("Using Mimi neural vocoder for decoding...")
-        return self.mimi.decode(safe_tokens)
-      except Exception as e:
-        print(f"Mimi neural vocoder failed: {e}, falling back to direct decoding")
+      return self.mimi.named_modules()
         
-        # Only use direct decoding as a fallback
-        try:
-          # Simple direct conversion
-          upsampling_factor = 120  # Each token expands to ~120 samples
-          audio_length = seq_len * upsampling_factor
-          
-          # Upsample using CUDA-safe interpolation
-          # Convert to float first
-          float_tokens = safe_tokens.float()
-
-          # To avoid CUDA kernel issues, normalize token values to 0-1 range
-          float_tokens = float_tokens / self.max_token
-
-          # Reshape for upsampling
-          float_tokens = float_tokens.permute(0, 2, 1)  # [B, L, C]
-
-          # Upsample efficiently with interpolate (CUDA-optimized)
-          upsampled = torch.nn.functional.interpolate(
-              float_tokens.unsqueeze(1),
-              # Add dummy channel dim [B, 1, L, C]
-              size=(audio_length, channels),
-              mode='bicubic',
-              align_corners=False
-          ).squeeze(1)  # Remove dummy dim -> [B, L', C]
-
-          # Convert back to original dimensions [B, C, L']
-          upsampled = upsampled.permute(0, 2, 1)
-
-          # Normalize to avoid clipping
-          upsampled = torch.tanh(upsampled)
-
-          # Average across channels to get final audio
-          audio = upsampled.mean(dim=1, keepdim=True)
-
-          print(f"Direct decoding fallback used, shape: {audio.shape}")
-          print(f"WARNING: Using approximation instead of neural vocoder!")
-          return audio
-          
-        except Exception as e2:
-          print(f"All decoding methods failed: {e2}")
-          
-          # Try using failsafe decoder as last resort
-          try:
-            from failsafe_decoder import get_failsafe_decoder
-            print("Attempting to use failsafe decoder...")
-            failsafe_decoder = get_failsafe_decoder()
-            audio = failsafe_decoder.decode(tokens)
-            print("Using failsafe decoder (will sound robotic)")
-            return audio
-          except ImportError:
-            # Re-raise original error if failsafe not available
-            raise e2
-
-          # Create and return the wrapper
-
-  return SafeMimiWrapper(original_mimi, device)
+    def parameters(self):
+      return self.mimi.parameters()
+        
+    def encode(self, audio):
+      return self.mimi.encode(audio)
+        
+    def decode(self, tokens):
+      # Minimal safety preprocessing
+      tokens = torch.clamp(tokens, min=0, max=self.max_token)
+        
+      # Fix channel dimensions if needed (common issue)
+      batch_size, channels, seq_len = tokens.shape
+      if channels == 1024:
+        tokens = tokens.reshape(batch_size, 512, 2, seq_len)
+        tokens = tokens.mean(dim=2).to(dtype=torch.long)
+        
+      # Use original mimi decoder - no custom upsampling
+      return self.mimi.decode(tokens)
+        
+  return MinimalMimiWrapper(original_mimi, device)
