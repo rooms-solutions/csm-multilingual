@@ -61,20 +61,29 @@ def watermark(
         # Fallback to audio device
         device = audio_array.device
     
+    print(f"Watermarker device: {device}, audio device: {audio_array.device}")
     audio_array = audio_array.to(device)
     
     # Resample to 44.1kHz on the same device
-    audio_array_44khz = torchaudio.functional.resample(audio_array, orig_freq=sample_rate, new_freq=44100)
+    audio_array_44khz = torchaudio.functional.resample(audio_array, orig_freq=sample_rate, new_freq=44100).to(device)
+    print(f"Resampled audio device: {audio_array_44khz.device}")
+    
+    # Ensure watermarker is on the same device
+    if hasattr(watermarker, 'to') and callable(getattr(watermarker, 'to')):
+        watermarker = watermarker.to(device)
+    
     encoded, _ = watermarker.encode_wav(audio_array_44khz, 44100, watermark_key, calc_sdr=False, message_sdr=36)
     
     # Explicitly ensure encoded is on the correct device
     encoded = encoded.to(device)
+    print(f"Encoded audio device: {encoded.device}")
 
     output_sample_rate = min(44100, sample_rate)
-    encoded = torchaudio.functional.resample(encoded, orig_freq=44100, new_freq=output_sample_rate)
+    encoded = torchaudio.functional.resample(encoded, orig_freq=44100, new_freq=output_sample_rate).to(device)
     
     # Final check to ensure output is on the correct device
     encoded = encoded.to(device)
+    print(f"Final watermarked audio device: {encoded.device}")
     return encoded, output_sample_rate
 
 

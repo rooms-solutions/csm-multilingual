@@ -178,19 +178,27 @@ class Model(nn.Module):
         if not hasattr(self.backbone, "causal_mask"):
             self.setup_caches(1)
 
-        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        # Debug info
+        print(f"Model generating frame with input device: {device}")
+        
+        # Ensure all inputs are on the same device
+        tokens = tokens.to(device)
+        tokens_mask = tokens_mask.to(device)
+        input_pos = input_pos.to(device)
+
+        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos).to(device)
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
         h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(device=device, dtype=dtype)
 
-        last_h = h[:, -1, :]
+        last_h = h[:, -1, :].to(device)
         c0_logits = self.codebook0_head(last_h)
-        c0_sample = sample_topk(c0_logits, topk, temperature)
+        c0_sample = sample_topk(c0_logits, topk, temperature).to(device)
         c0_embed = self._embed_audio(0, c0_sample)
 
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1).to(device)
-        curr_sample = c0_sample.clone()
+        curr_sample = c0_sample.clone().to(device)
         
         # Create fixed positions for the decoder with explicit device
         batch_size = curr_h.size(0)
@@ -205,7 +213,7 @@ class Model(nn.Module):
             ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
             
             # Ensure projection output has exactly 2 sequence positions
-            projection_out = self.projection(curr_h)
+            projection_out = self.projection(curr_h).to(device)
             if projection_out.size(1) != 2:
                 # Force to exactly 2 positions
                 if projection_out.size(1) > 2:
@@ -229,14 +237,17 @@ class Model(nn.Module):
             # Ensure audio_head is on same device before matmul
             audio_head_i = self.audio_head[i - 1].to(device)
             ci_logits = torch.matmul(decoder_h[:, -1, :], audio_head_i)
-            ci_sample = sample_topk(ci_logits, topk, temperature)
+            ci_sample = sample_topk(ci_logits, topk, temperature).to(device)
             ci_embed = self._embed_audio(i, ci_sample)
 
             curr_h = ci_embed.to(device)
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1).to(device)
             curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=device) 
             curr_pos[:, 1] = 1
-
+            
+        # Final device check
+        curr_sample = curr_sample.to(device)
+        print(f"Generated frame output device: {curr_sample.device}")
         return curr_sample
 
     def reset_caches(self):

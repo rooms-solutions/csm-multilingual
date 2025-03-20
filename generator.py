@@ -120,6 +120,7 @@ class Generator:
     ) -> torch.Tensor:
         # Get device from model
         device = self.device
+        print(f"Generation device: {device}")
         
         # Reset caches
         self._model.reset_caches()
@@ -153,29 +154,51 @@ class Generator:
             if torch.all(sample == 0):
                 break  # eos
 
+            # Verify device consistency
+            sample = sample.to(device)
             samples.append(sample)
 
-            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+            curr_tokens = torch.cat([sample, torch.zeros(1, 1, device=device).long()], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
-                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                [torch.ones_like(sample, device=device).bool(), torch.zeros(1, 1, device=device).bool()], dim=1
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-        # Stack samples and decode - ensure we have consistent device handling
-        device = self.device
+        # Stack samples and decode
+        print(f"Stacking samples on device: {device}")
         stacked_samples = torch.stack(samples).to(device)
-        audio = self._audio_tokenizer.decode(stacked_samples.permute(1, 2, 0)).squeeze(0).squeeze(0)
-    
-        # Make sure audio tensor is on the correct device after tokenizer decode
-        audio = audio.to(device)
-
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
+        
+        # Critical fix: Ensure audio tokenizer decode preserves device
         try:
+            # Set the mimi model to the correct device first
+            if hasattr(self._audio_tokenizer, 'to'):
+                self._audio_tokenizer = self._audio_tokenizer.to(device)
+                
+            # Use permute to correctly transform the stacked samples
+            permuted_samples = stacked_samples.permute(1, 2, 0).to(device)
+            
+            # Print debug info
+            print(f"Decoding with samples on device: {permuted_samples.device}")
+            print(f"Audio tokenizer on device: {next(self._audio_tokenizer.parameters()).device}")
+            
+            # Decode the audio (this is where device mismatch likely occurs)
+            audio = self._audio_tokenizer.decode(permuted_samples)
+            
+            # Immediately move result to correct device and reshape
+            audio = audio.to(device)
+            audio = audio.squeeze(0).squeeze(0).to(device)
+            
+            print(f"After decode, audio on device: {audio.device}")
+        except Exception as e:
+            print(f"Error during audio decode: {e}")
+            raise
+
+        # Watermarking
+        try:
+            print(f"Applying watermark to audio on device: {audio.device}")
             audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
             audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate).to(device)
+            print(f"After watermarking, audio on device: {audio.device}")
         except Exception as e:
             print(f"Warning: Could not apply watermark: {e}")
             print("Continuing without watermarking")
