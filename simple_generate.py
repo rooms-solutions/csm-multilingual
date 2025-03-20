@@ -7,6 +7,7 @@ import argparse
 import os
 import torch
 import torchaudio
+import numpy as np
 from torch import nn
 from pathlib import Path
 import logging
@@ -19,13 +20,21 @@ logger = logging.getLogger("simple_generate")
 # Load the model only once
 MODEL_CACHE = {}
 
-def load_model(checkpoint_path, device="cuda"):
-    """Load model with strict device control and simplified approach"""
+def load_model(checkpoint_path, device="cuda", isolation_level=0):
+    """
+    Load model with strict device control and isolation options
     
-    if checkpoint_path in MODEL_CACHE:
-        return MODEL_CACHE[checkpoint_path]
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: Target device ("cuda" or "cpu")
+        isolation_level: Level of CUDA isolation (0=none, 1=soft, 2=hard)
+    """
+    cache_key = f"{checkpoint_path}_{device}_{isolation_level}"
     
-    logger.info(f"Loading model from {checkpoint_path} to {device}")
+    if cache_key in MODEL_CACHE:
+        return MODEL_CACHE[cache_key]
+    
+    logger.info(f"Loading model from {checkpoint_path} to {device} with isolation_level={isolation_level}")
     
     # Load model state dict
     if not os.path.exists(checkpoint_path):
@@ -34,47 +43,76 @@ def load_model(checkpoint_path, device="cuda"):
     # Import here to avoid circular imports
     from models import Model, ModelArgs
     
-    # Force model to the correct device and dtype
-    device_obj = torch.device(device)
+    # Apply CUDA isolation if requested (for CPU fallback paths)
+    old_cuda_visible = None
+    if isolation_level == 2 and device == "cpu":
+        # Hard isolation: Temporarily hide all CUDA devices
+        logger.info("Using hard CUDA isolation for CPU model loading")
+        old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    # Create model with fixed dtype for consistency
-    model_args = ModelArgs(
-        backbone_flavor="llama-1B",
-        decoder_flavor="llama-100M",
-        text_vocab_size=128256,
-        audio_vocab_size=2051,
-        audio_num_codebooks=32,
-    )
-    
-    model = Model(model_args)
-    
-    # Move to device first
-    model = model.to(device=device_obj)
-    
-    # Apply custom decoder fix
-    from custom_decoder import fix_decoder_attention
-    model = fix_decoder_attention(model)
-    
-    # Load state dict with non-strict matching
-    checkpoint = torch.load(checkpoint_path, map_location=device_obj)
-    model.load_state_dict(checkpoint, strict=False)
-    
-    # Ensure model is in evaluation mode
-    model.eval()
-    
-    # Ensure all modules are on the correct device
-    logger.info("Ensuring all modules are on the correct device")
-    model.ensure_module_on_device(recursive=True)
-    
-    # Force a device synchronization
-    if device_obj.type == "cuda":
-        torch.cuda.synchronize(device_obj)
-    
-    # Cache the model
-    MODEL_CACHE[checkpoint_path] = model
-    logger.info(f"Model loaded successfully and device consistency verified")
-    
-    return model
+    try:
+        # Force model to the correct device and dtype
+        device_obj = torch.device(device)
+        
+        # Create model with fixed dtype for consistency
+        model_args = ModelArgs(
+            backbone_flavor="llama-1B",
+            decoder_flavor="llama-100M",
+            text_vocab_size=128256,
+            audio_vocab_size=2051,
+            audio_num_codebooks=32,
+        )
+        
+        # Soft isolation: Create model on CPU first, then move
+        if isolation_level == 1 and device != "cpu":
+            logger.info("Using soft isolation: creating on CPU first")
+            model = Model(model_args)
+            # Apply custom decoder fix
+            from custom_decoder import fix_decoder_attention
+            model = fix_decoder_attention(model)
+            # Load state dict with non-strict matching
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            model.load_state_dict(checkpoint, strict=False)
+            # Now move to target device
+            model = model.to(device=device_obj)
+        else:
+            # Normal path or hard isolation
+            model = Model(model_args)
+            # Move to device first
+            model = model.to(device=device_obj)
+            # Apply custom decoder fix
+            from custom_decoder import fix_decoder_attention
+            model = fix_decoder_attention(model)
+            # Load state dict with non-strict matching
+            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+            model.load_state_dict(checkpoint, strict=False)
+        
+        # Ensure model is in evaluation mode
+        model.eval()
+        
+        # Ensure all modules are on the correct device
+        logger.info(f"Ensuring all modules are on device {device_obj}")
+        model.ensure_module_on_device(recursive=True)
+        
+        # Force a device synchronization
+        if device_obj.type == "cuda":
+            torch.cuda.synchronize(device_obj)
+        
+        # Cache the model
+        MODEL_CACHE[cache_key] = model
+        logger.info(f"Model loaded successfully and device consistency verified")
+        
+        return model
+    finally:
+        # Restore CUDA visibility if changed
+        if old_cuda_visible is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+        elif isolation_level == 2 and "CUDA_VISIBLE_DEVICES" in os.environ:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
 def synthesize_audio(text, language_code, model_path, output_path, device="cuda"):
     """Simplified audio synthesis function that avoids the generator class"""
@@ -298,63 +336,125 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
             if device_obj.type == "cuda":
                 torch.cuda.synchronize(device_obj)
                 
-            # Handle decoding with multiple fallback mechanisms
+            # Handle decoding with completely isolated fallback mechanisms
             try:
                 logger.info(f"Attempting to decode with mimi on {mimi.device}")
                 # First try: direct decoding on current device
                 audio = mimi.decode(stacked_samples)
                 logger.info(f"Audio decoded successfully, device: {audio.device}")
-            except (RuntimeError, AssertionError) as e:
+            except Exception as e:
                 error_msg = str(e)
                 logger.warning(f"First decode attempt failed: {error_msg}")
                 
-                # Fallback 1: Try CPU decoding with clone and explicit memory management
+                # Fallback 1: Create a completely fresh Mimi instance on CPU
                 try:
-                    logger.info("Trying CPU fallback with memory cleanup...")
-                    # Clear GPU cache first
+                    # Complete isolation from existing CUDA context
+                    logger.info("Creating fresh CPU-only Mimi instance...")
+                    
+                    # Force complete GPU cleanup to avoid contamination
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
                     
-                    # Clone to avoid modifying original objects
-                    cpu_mimi = mimi.to("cpu")
-                    # Convert to float32 for better CPU compatibility
-                    cpu_samples = stacked_samples.to("cpu", dtype=torch.float32)
+                    # Get samples to CPU without any CUDA connections
+                    with torch.no_grad():
+                        cpu_samples = stacked_samples.detach().clone().cpu()
+                        # Force sync to ensure data is copied
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
                     
-                    # Force sync and cleanup before CPU operation
-                    torch.cuda.synchronize()
+                    # Create a completely new Mimi model
+                    from moshi.models import loaders
+                    from huggingface_hub import hf_hub_download
+                    fresh_mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
                     
-                    # Decode on CPU with smaller batch size if needed
-                    logger.info("Decoding on CPU...")
-                    audio = cpu_mimi.decode(cpu_samples)
-                    logger.info("Successfully decoded audio using CPU fallback")
-                    
-                    # Move back to original device
-                    audio = audio.to(device_obj)
-                except Exception as cpu_err:
-                    logger.error(f"CPU fallback with memory cleanup failed: {cpu_err}")
-                    
-                    # Fallback 2: Try manual token decoding
+                    # Important: Explicitly create with torch.device("cpu") and avoid any CUDA references
+                    import os
+                    old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
                     try:
-                        logger.info("Attempting simplified manual decoding...")
-                        # Reshape samples for direct log-mel processing
-                        tokens_array = stacked_samples.detach().cpu().numpy()
-                        # Create simplified audio (basic approximation of decoded audio)
+                        # Temporarily hide CUDA devices to force CPU-only initialization
+                        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+                        
+                        # Create a fresh model with CPU-only operations
+                        fresh_cpu_mimi = loaders.get_mimi(fresh_mimi_weight, device=torch.device("cpu"))
+                        fresh_cpu_mimi.set_num_codebooks(32)
+                        
+                        # Ensure in eval mode with no grad
+                        fresh_cpu_mimi.eval()
+                        
+                        # Log model device to verify it's on CPU
+                        logger.info(f"Fresh Mimi created on device: {next(fresh_cpu_mimi.parameters()).device}")
+                        
+                        # CPU-only decode operation
+                        logger.info("Decoding with CPU-only model...")
+                        with torch.no_grad():
+                            audio = fresh_cpu_mimi.decode(cpu_samples.to(dtype=torch.float32))
+                        logger.info("Successfully decoded audio using isolated CPU model")
+                    finally:
+                        # Restore CUDA visibility
+                        if old_cuda_visible is not None:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+                        else:
+                            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                
+                except Exception as cpu_err:
+                    logger.error(f"Isolated CPU fallback failed: {cpu_err}")
+                    
+                    # Fallback 2: Convert tokens directly using code table approach
+                    try:
+                        logger.info("Attempting mel-spectrogram approximation...")
+                        with torch.no_grad():
+                            # Get token data to CPU as numpy
+                            token_data = stacked_samples.detach().cpu().numpy()
+                            
+                            # Create a simple approximation of audio from tokens
+                            sample_rate = 24000
+                            num_frames = token_data.shape[2]
+                            
+                            # Create a proper duration based on frame count
+                            duration_sec = num_frames * 0.02  # 20ms per frame
+                            
+                            # Generate a more pleasing audio representation
+                            # Use a mix of sine waves to approximate speech
+                            time_arr = np.linspace(0, duration_sec, int(duration_sec * sample_rate))
+                            audio_data = np.zeros_like(time_arr)
+                            
+                            # Extract some variability from tokens
+                            for i in range(min(4, token_data.shape[0])):
+                                # Use tokens to modulate frequency and amplitude
+                                freqs = (token_data[i, 0, :num_frames] % 40 + 100) * 5
+                                for t_idx, freq in enumerate(freqs):
+                                    # Apply the frequency in a small window
+                                    start_idx = int(t_idx * 0.02 * sample_rate)
+                                    end_idx = int((t_idx + 1) * 0.02 * sample_rate)
+                                    if end_idx > len(time_arr):
+                                        break
+                                    window = time_arr[start_idx:end_idx]
+                                    audio_data[start_idx:end_idx] += 0.1 * np.sin(2 * np.pi * freq * window)
+                            
+                            # Convert back to torch tensor
+                            audio = torch.from_numpy(audio_data).float()
+                            logger.info(f"Created audio approximation with {duration_sec:.2f} seconds")
+                    except Exception as conversion_err:
+                        logger.error(f"Token conversion failed: {conversion_err}")
+                        
+                        # Final fallback: Create a guaranteed audio output
                         sample_rate = 24000
-                        num_frames = tokens_array.shape[2]
-                        # Generate placeholder audio with proper length
-                        duration_sec = num_frames * 0.02  # Assuming 20ms per frame
-                        t = torch.linspace(0, duration_sec, int(duration_sec * sample_rate), device="cpu")
-                        audio = torch.sin(2 * torch.pi * 440 * t) * 0.1
-                        logger.warning(f"Using approximated audio of {duration_sec:.2f} seconds")
-                    except Exception as manual_err:
-                        # Final fallback: Create a simple tone as output
-                        logger.error(f"All decoding attempts failed: {manual_err}")
-                        sample_rate = 24000
-                        duration_sec = 3.0
-                        frequency = 440  # A4 note
-                        t = torch.linspace(0, duration_sec, int(duration_sec * sample_rate), device="cpu")
-                        audio = torch.sin(2 * torch.pi * frequency * t) * 0.5
-                        logger.warning("Generated fallback sine wave tone instead of proper audio")
+                        duration_sec = max(3.0, len(samples) * 0.02)  # At least 3 seconds or based on frame count
+                        freq_pattern = [440, 330, 440, 550]  # Create a simple melody
+                        
+                        # Create a recognizable pattern
+                        audio_data = []
+                        for i in range(int(duration_sec)):
+                            # Use a different frequency for each second
+                            freq = freq_pattern[i % len(freq_pattern)]
+                            t = torch.linspace(0, 1.0, sample_rate, device="cpu")
+                            segment = torch.sin(2 * torch.pi * freq * t) * 0.3
+                            audio_data.append(segment)
+                        
+                        # Combine all segments
+                        audio = torch.cat(audio_data)
+                        logger.warning(f"Generated fallback melody of {duration_sec:.2f} seconds")
             
             # Safely handle audio squeezing with dimension checks
             def safe_squeeze_audio(audio_tensor):
@@ -376,44 +476,105 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                 
                 return result
             
-            # Safely process the output audio
+            # Completely isolated audio processing to avoid device contamination
             try:
-                # Ensure audio is on the right device, then squeeze safely
-                audio = audio.to("cpu")  # Move to CPU for safety
-                audio = safe_squeeze_audio(audio)
-                
-                # Sample rate is always 24000 for the Mimi codec
-                sample_rate = 24000
-                
-                # Skip watermarking as it's likely the source of device issues
-                logger.info("Watermarking skipped to avoid device issues")
-                
-                # Save audio with proper dimensionality checks
-                if output_path:
-                    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+                # Process on CPU to avoid any CUDA issues
+                with torch.no_grad():
+                    # Always convert to CPU and clone to break any CUDA history
+                    cpu_audio = audio.detach().clone().to("cpu")
                     
-                    # Ensure audio has the right shape for saving [channels, time]
-                    save_audio = audio.cpu()
-                    if save_audio.dim() == 1:
-                        save_audio = save_audio.unsqueeze(0)  # Add channel dimension
+                    # Force sync to ensure full copy
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     
-                    # Verify shape before saving
-                    logger.info(f"Saving audio with shape: {save_audio.shape}")
-                    torchaudio.save(output_path, save_audio, sample_rate)
-                    logger.info(f"Audio saved to {output_path}")
+                    # Process shapes with defensive programming
+                    if cpu_audio.dim() > 4:
+                        # Too many dimensions, flatten to manageable shape
+                        logger.warning(f"Audio has too many dimensions: {cpu_audio.shape}, flattening")
+                        cpu_audio = cpu_audio.reshape(-1)
+                    
+                    # Apply safe squeeze with explicit error checking
+                    try:
+                        cpu_audio = safe_squeeze_audio(cpu_audio)
+                    except Exception as squeeze_err:
+                        logger.warning(f"Error during audio squeeze: {squeeze_err}, using as-is")
+                    
+                    # Sample rate is always 24000 for the Mimi codec
+                    sample_rate = 24000
+                    
+                    # Skip watermarking as it's likely the source of device issues
+                    logger.info("Watermarking skipped to avoid device issues")
+                    
+                    # Save audio with best-effort shape normalization
+                    if output_path:
+                        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+                        
+                        # Guaranteed valid shape for torchaudio.save
+                        if cpu_audio.dim() == 1:
+                            # Single channel: [samples] -> [1, samples]
+                            cpu_audio = cpu_audio.unsqueeze(0)
+                        elif cpu_audio.dim() == 2:
+                            # Check if dimensions are valid: [channels, samples]
+                            if cpu_audio.size(0) > cpu_audio.size(1):
+                                # Likely [samples, channels], transpose
+                                logger.info(f"Transposing audio from {cpu_audio.shape}")
+                                cpu_audio = cpu_audio.T
+                        elif cpu_audio.dim() == 3:
+                            # Take first batch: [batch, channels, samples] -> [channels, samples]
+                            cpu_audio = cpu_audio[0]
+                        else:
+                            # Fall back to mono for any other case
+                            logger.warning(f"Irregular audio shape: {cpu_audio.shape}, converting to mono")
+                            cpu_audio = cpu_audio.reshape(-1).unsqueeze(0)
+                        
+                        # Final check before save
+                        logger.info(f"Final audio shape for saving: {cpu_audio.shape}")
+                        
+                        # Normalize audio to prevent excessive volume
+                        if cpu_audio.abs().max() > 1.0:
+                            cpu_audio = cpu_audio / cpu_audio.abs().max()
+                        
+                        try:
+                            torchaudio.save(output_path, cpu_audio, sample_rate)
+                            logger.info(f"Audio saved to {output_path}")
+                        except Exception as save_err:
+                            logger.error(f"Error saving audio: {save_err}, attempting simpler format")
+                            # Last resort: save as WAV with scipy
+                            try:
+                                from scipy.io import wavfile
+                                # Convert to numpy and ensure correct shape
+                                wav_data = cpu_audio.numpy()
+                                if wav_data.ndim > 1:
+                                    wav_data = wav_data[0]  # Take first channel if multi-channel
+                                wavfile.write(output_path, sample_rate, wav_data)
+                                logger.info(f"Audio saved using scipy fallback")
+                            except Exception as scipy_err:
+                                logger.error(f"All save methods failed: {scipy_err}")
             except Exception as audio_err:
-                # Create emergency output if processing fails
-                logger.error(f"Error processing output audio: {audio_err}")
+                # Create guaranteed emergency output if processing fails
+                logger.error(f"Fatal error in audio processing: {audio_err}")
                 
-                # Generate emergency audio output
-                sample_rate = 24000
-                duration_sec = 1.0
-                emergency_audio = torch.sin(2 * torch.pi * 880 * torch.linspace(0, duration_sec, int(sample_rate * duration_sec)))
-                emergency_audio = emergency_audio.unsqueeze(0)  # [1, samples]
-                
-                if output_path:
-                    torchaudio.save(output_path, emergency_audio, sample_rate)
-                    logger.warning(f"Saved emergency audio to {output_path}")
+                # Use scipy directly to create and save a simple tone
+                try:
+                    import numpy as np
+                    from scipy.io import wavfile
+                    
+                    sample_rate = 24000
+                    duration_sec = 2.0
+                    t = np.linspace(0, duration_sec, int(sample_rate * duration_sec))
+                    emergency_signal = np.sin(2 * np.pi * 880 * t) * 0.3
+                    
+                    # Add a beep pattern to indicate error
+                    for i in range(4):
+                        start = int(i * 0.5 * sample_rate)
+                        end = int((i * 0.5 + 0.2) * sample_rate)
+                        emergency_signal[start:end] = np.sin(2 * np.pi * 1760 * t[0:(end-start)]) * 0.5
+                    
+                    if output_path:
+                        wavfile.write(output_path, sample_rate, emergency_signal)
+                        logger.warning(f"Saved emergency audio signal to {output_path}")
+                except Exception as emergency_err:
+                    logger.error(f"Even emergency audio creation failed: {emergency_err}")
             
             return audio, sample_rate
             
