@@ -57,6 +57,12 @@ class Generator:
     mimi.set_num_codebooks(32)
     self._audio_tokenizer = mimi
 
+    # Store maximum token value for safety checks during decoding
+    if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
+        self.max_token_value = mimi.vq.codebook_size - 1
+    else:
+        self.max_token_value = 2048  # Safe default
+
     self._watermarker = load_watermarker(device=self.device)
 
     # No need for parameter check as we've made load_watermarker robust
