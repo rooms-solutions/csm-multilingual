@@ -101,7 +101,9 @@ def generate_audio(
     # Save audio if output path is provided
     if output_path:
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-        torchaudio.save(output_path, audio.unsqueeze(0), generator.sample_rate)
+        # Move to CPU for saving as torchaudio.save requires CPU tensors
+        audio_cpu = audio.cpu()
+        torchaudio.save(output_path, audio_cpu.unsqueeze(0), generator.sample_rate)
         print(f"Audio saved to {output_path}")
     
     return audio

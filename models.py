@@ -266,6 +266,10 @@ class Model(nn.Module):
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
         """Embed audio tokens with enhanced dimension handling"""
         try:
+            # Get device directly from model parameters for consistency
+            device = next(self.parameters()).device
+            tokens = tokens.to(device)
+            
             # Normalize token shape for consistent handling
             # Ensure tokens is 2D: [batch_size, seq_len]
             if tokens.dim() == 1:
@@ -274,13 +278,16 @@ class Model(nn.Module):
                 tokens = tokens.view(tokens.size(0), -1)
                 
             # Compute embedding with proper offset
-            embeddings = self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+            offset_tokens = tokens + codebook * self.args.audio_vocab_size
+            offset_tokens = offset_tokens.to(device)
+            embeddings = self.audio_embeddings(offset_tokens)
             
             # Ensure output has shape [batch_size, seq_len, dim]
             if embeddings.dim() == 2:
                 embeddings = embeddings.unsqueeze(1)
                 
-            return embeddings
+            # Make sure embeddings are on the right device before returning
+            return embeddings.to(device)
             
         except RuntimeError as e:
             # Enhanced error handling with more diagnostic info
