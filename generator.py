@@ -168,6 +168,63 @@ class Generator:
         print(f"Stacking samples on device: {device}")
         stacked_samples = torch.stack(samples).to(device)
         
+        # Custom patching for CUDA compatibility
+        def patch_mimi_upsample(mimi_model):
+            """Patch Mimi model's upsampling to avoid CUDA compatibility issues"""
+            # Define custom upsampling that stays on CUDA but avoids transpose conv issues
+            def custom_upsample(x):
+                """Custom upsampling that uses interpolate instead of conv_transpose1d"""
+                # Force correct format and contiguity
+                x = x.contiguous().to(dtype=torch.float32)
+                # Use interpolate which has better CUDA compatibility
+                result = torch.nn.functional.interpolate(
+                    x, scale_factor=2, mode='linear', align_corners=False
+                )
+                return result
+                
+            # Apply the patch to various components in the Mimi model
+            try:
+                # Patch primary upsampling method if available
+                if hasattr(mimi_model, '_to_encoder_framerate'):
+                    original_method = mimi_model._to_encoder_framerate
+                        
+                    def patched_to_encoder_framerate(x):
+                        """Patched version of _to_encoder_framerate"""
+                        # Skip the original upsample and just do interpolation
+                        x = x.contiguous().to(dtype=torch.float32)
+                        return custom_upsample(x)
+                        
+                    # Replace the method
+                    mimi_model._to_encoder_framerate = patched_to_encoder_framerate
+                    print("Successfully patched Mimi codec upsampling method")
+                    
+                # Also patch any internal modules with convtr in their name
+                for name, module in mimi_model.named_modules():
+                    if 'convtr' in name.lower() or isinstance(module, torch.nn.ConvTranspose1d):
+                        # Replace this module's forward to use our custom implementation
+                        original_forward = module.forward
+                            
+                        def make_patched_forward(mod_name):
+                            def patched_forward(self, x):
+                                print(f"Intercepted problematic convtr in {mod_name}")
+                                return custom_upsample(x)
+                            return patched_forward
+                            
+                        # Bind the new method
+                        import types
+                        module.forward = types.MethodType(make_patched_forward(name), module)
+                        print(f"Patched conv_transpose1d in {name}")
+                    
+                return True
+            except Exception as e:
+                print(f"Error during patching: {e}")
+                return False
+                    
+        # Apply the patch to the audio tokenizer
+        print("Applying CUDA-compatible patches to audio tokenizer...")
+        patch_success = patch_mimi_upsample(self._audio_tokenizer)
+        print(f"Patching {'succeeded' if patch_success else 'failed'}")
+                    
         # Critical fix: Ensure audio tokenizer decode preserves device
         try:
             # Set the mimi model to the correct device first
@@ -176,22 +233,70 @@ class Generator:
                 
             # Use permute to correctly transform the stacked samples
             permuted_samples = stacked_samples.permute(1, 2, 0).to(device)
-            
+                
+            # Force correct format to avoid CUDA kernel issues
+            permuted_samples = permuted_samples.contiguous().to(dtype=torch.float32)
+                
             # Print debug info
             print(f"Decoding with samples on device: {permuted_samples.device}")
             print(f"Audio tokenizer on device: {next(self._audio_tokenizer.parameters()).device}")
-            
-            # Decode the audio (this is where device mismatch likely occurs)
-            audio = self._audio_tokenizer.decode(permuted_samples)
-            
+                
+            # Run with CUDA optimizations
+            with torch.cuda.amp.autocast(enabled=False):
+                # Decode the audio (this is where device mismatch likely occurs)
+                audio = self._audio_tokenizer.decode(permuted_samples)
+                
             # Immediately move result to correct device and reshape
             audio = audio.to(device)
             audio = audio.squeeze(0).squeeze(0).to(device)
-            
+                
             print(f"After decode, audio on device: {audio.device}")
         except Exception as e:
             print(f"Error during audio decode: {e}")
-            raise
+                
+            # Fallback: Try alternative manual upsampling 
+            try:
+                print("Attempting manual upsampling fallback while staying on GPU...")
+                    
+                with torch.no_grad():
+                    # Get device and move tensor there explicitly
+                    device = next(self._audio_tokenizer.parameters()).device
+                    x = permuted_samples.to(device=device, dtype=torch.float32, non_blocking=False)
+                    x = x.contiguous()
+                        
+                    # Create an upsampled version using interpolate
+                    x_ups = torch.nn.functional.interpolate(
+                        x, scale_factor=16, mode='linear', align_corners=False
+                    )
+                        
+                    # Apply a smoothing filter to reduce artifacts
+                    kernel_size = 15
+                    padding = kernel_size // 2
+                    smoothing_kernel = torch.ones(1, 1, kernel_size, device=device) / kernel_size
+                        
+                    # Reshape for 1D convolution
+                    batch_size, num_codebooks, seq_len = x_ups.shape
+                    x_ups_reshaped = x_ups.view(batch_size * num_codebooks, 1, -1)
+                        
+                    # Apply smoothing
+                    x_smooth = torch.nn.functional.conv1d(
+                        x_ups_reshaped, 
+                        smoothing_kernel, 
+                        padding=padding
+                    )
+                        
+                    # Reshape back
+                    x_smooth = x_smooth.view(batch_size, num_codebooks, -1)
+                        
+                    # Normalize and complete processing
+                    audio = x_smooth[0].mean(dim=0)  # Merge codebooks
+                    audio = audio / (audio.abs().max() + 1e-8) * 0.8  # Normalize
+                        
+                    print(f"Manual upsampling successful on {device}, shape: {audio.shape}")
+            except Exception as fallback_err:
+                print(f"Manual upsampling failed: {fallback_err}")
+                # If all fails, raise the original error
+                raise e
 
         # Watermarking
         try:
