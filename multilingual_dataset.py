@@ -158,8 +158,7 @@ class MultilingualVoiceDataset(Dataset):
                 token_min = audio_tokens.min().item()
                 token_max = audio_tokens.max().item()
                 token_mean = audio_tokens.float().mean().item()
-                print(f"Audio tokens range: min={token_min}, max={token_max}, mean={token_mean:.2f}")
-                
+
                 # Validate by decoding and re-encoding a sample
                 if idx == 0:
                     try:
