@@ -116,7 +116,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             logits = torch.matmul(projection_output, audio_head)
         
         # Get target and compute loss
-        target = audio_tokens[:, i].reshape(-1)
+        # For CSM, we should predict just the first token in each sequence for each codebook
+        # Audio tokens shape is [batch_size, num_codebooks, seq_len]
+        target = audio_tokens[:, i, 0]  # Just take the first token position for each batch item
+        # Ensure target has correct device and dtype
+        target = target.to(device=logits.device, dtype=torch.long)
         loss = torch.nn.functional.cross_entropy(logits, target)
         total_loss += loss
     
