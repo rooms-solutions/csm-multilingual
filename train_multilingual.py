@@ -653,6 +653,14 @@ def main():
     parser.add_argument("--stable_training", action="store_true", 
                         help="Enable additional numerical stability measures (slightly slower but more robust)")
     
+    # CSM pretrained model arguments
+    parser.add_argument("--use_csm_pretrained", action="store_true",
+                        help="Use CSM-1B pretrained weights as base model")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Freeze backbone parameters to preserve CSM-1B capabilities")
+    parser.add_argument("--preserve_learning_rate", action="store_true",
+                        help="Don't reduce learning rate when fine-tuning")
+    
     args = parser.parse_args()
     
     # Start training
