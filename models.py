@@ -174,9 +174,10 @@ class Model(nn.Module):
         dtype = next(self.parameters()).dtype
         b, s, _ = tokens.size()
 
-        # Replace the assert with a check to ensure caches are properly initialized
-        if not hasattr(self.backbone, "causal_mask"):
-            self.setup_caches(1)
+        # Ensure caches are set up - create if missing
+        if not hasattr(self, "backbone_causal_mask"):
+            print("Setting up caches before generation...")
+            self.setup_caches(b)
 
         # Debug info
         print(f"Model generating frame with input device: {device}")
@@ -186,6 +187,13 @@ class Model(nn.Module):
         tokens_mask = tokens_mask.to(device)
         input_pos = input_pos.to(device)
 
+        # Get the backbone mask, ensuring it exists
+        if not hasattr(self, "backbone_causal_mask"):
+            # If still missing despite trying to set up, create a fallback mask
+            print("Creating fallback causal mask")
+            backbone_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
+            self.register_buffer("backbone_causal_mask", backbone_mask, persistent=True)
+            
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos).to(device)
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)

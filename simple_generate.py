@@ -91,6 +91,10 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
     # Load model
     model = load_model(model_path, device)
     
+    # Important: Setup caches for generation
+    logger.info("Setting up model caches for generation")
+    model.setup_caches(1)  # Setup for batch size 1
+    
     # Load audio tokenizer
     from moshi.models import loaders
     from huggingface_hub import hf_hub_download
@@ -116,8 +120,11 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
             # We'll collect audio tokens manually without the generate function
             samples = []
             
-            # Reset any caches
+            # Reset and ensure caches are set up
             model.reset_caches()
+            if not hasattr(model, "backbone_causal_mask"):
+                logger.info("Re-initializing caches before generation")
+                model.setup_caches(1)
             
             # Get the initial state from the model
             logger.info("Starting generation...")
