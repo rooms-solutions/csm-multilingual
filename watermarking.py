@@ -74,15 +74,19 @@ def watermark(
     
     encoded, _ = watermarker.encode_wav(audio_array_44khz, 44100, watermark_key, calc_sdr=False, message_sdr=36)
     
-    # Explicitly ensure encoded is on the correct device
+    # Explicitly ensure encoded is on the correct device with sync
     encoded = encoded.to(device)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
     print(f"Encoded audio device: {encoded.device}")
 
     output_sample_rate = min(44100, sample_rate)
     encoded = torchaudio.functional.resample(encoded, orig_freq=44100, new_freq=output_sample_rate).to(device)
-    
-    # Final check to ensure output is on the correct device
+        
+    # Final check to ensure output is on the correct device with sync
     encoded = encoded.to(device)
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
     print(f"Final watermarked audio device: {encoded.device}")
     return encoded, output_sample_rate
 

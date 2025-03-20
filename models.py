@@ -72,8 +72,17 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     Returns:
         (batch_size, seq_len, max_seq_len)
     """
+    # Ensure both tensors are on the same device
+    device = mask.device
+    input_pos = input_pos.to(device)
+    
+    # Clamp input_pos to valid indices to avoid out-of-bounds access
+    max_idx = mask.size(0) - 1
+    input_pos = torch.clamp(input_pos, 0, max_idx)
+    
+    # Index the mask
     r = mask[input_pos, :]
-    return r
+    return r.to(device)
 
 
 def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
@@ -123,10 +132,13 @@ class Model(nn.Module):
         
         With our custom decoder, we only need to set up backbone caches.
         """
+        # Get device directly from parameters to ensure consistency
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         
-        # Create fresh causal masks
+        print(f"Setting up caches on device: {device}")
+        
+        # Create fresh causal masks with explicit device
         backbone_max_seq_len = getattr(self.backbone, 'max_seq_len', 2048)
         backbone_mask = _create_causal_mask(backbone_max_seq_len, device)
         # Always use size 2 for decoder to ensure consistent dimensions
@@ -139,17 +151,35 @@ class Model(nn.Module):
         # Store current batch size as an attribute to check later
         self._current_batch_size = max_batch_size
         
+        # Force synchronization to ensure all tensor operations are complete
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        
         # For backbone only - we're using our custom decoder that doesn't need caching
         try:
+            # Move backbone to correct device first if needed
+            if hasattr(self.backbone, 'to'):
+                self.backbone = self.backbone.to(device)
+                
             if hasattr(self.backbone, 'setup_caches'):
                 self.backbone.setup_caches(max_batch_size, dtype)
+                if hasattr(self.backbone, 'kv_caches') and self.backbone.kv_caches:
+                    # Explicitly move any created caches to the correct device
+                    for cache in self.backbone.kv_caches:
+                        if hasattr(cache, 'to'):
+                            cache.to(device)
             # Additional check for setting up kv cache directly
             elif hasattr(self.backbone, 'setup_kv_cache'):
                 self.backbone.setup_kv_cache(max_batch_size)
+                
+            # Force synchronization again
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
         except Exception as e:
             print(f"Note: Using simplified caching mechanism: {e}")
         
-        return backbone_mask
+        # Return mask that's guaranteed to be on the correct device
+        return backbone_mask.to(device)
 
     def generate_frame(
         self,
@@ -169,8 +199,8 @@ class Model(nn.Module):
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
         """
-        # Get device and dtype consistently
-        device = tokens.device
+        # Get device from parameters to ensure consistency
+        param_device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         b, s, _ = tokens.size()
 
@@ -180,25 +210,55 @@ class Model(nn.Module):
             self.setup_caches(b)
 
         # Debug info
-        print(f"Model generating frame with input device: {device}")
+        print(f"Parameter device: {param_device}, Input device: {tokens.device}")
         
-        # Ensure all inputs are on the same device
-        tokens = tokens.to(device)
-        tokens_mask = tokens_mask.to(device)
-        input_pos = input_pos.to(device)
+        # Force all inputs to the parameter device for consistency
+        device = param_device
+        tokens = tokens.to(device, non_blocking=False)
+        tokens_mask = tokens_mask.to(device, non_blocking=False)
+        input_pos = input_pos.to(device, non_blocking=False)
+        
+        # Force synchronization to ensure device transfers are complete
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
-        # Get the backbone mask, ensuring it exists
+        # Get the backbone mask, ensuring it exists and is on the right device
         if not hasattr(self, "backbone_causal_mask"):
             # If still missing despite trying to set up, create a fallback mask
             print("Creating fallback causal mask")
             backbone_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
             self.register_buffer("backbone_causal_mask", backbone_mask, persistent=True)
-            
-        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos).to(device)
+        
+        # Ensure backbone_causal_mask is on the right device    
+        self.backbone_causal_mask = self.backbone_causal_mask.to(device, non_blocking=False)
+        
+        # Create the mask for this input
+        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        curr_backbone_mask = curr_backbone_mask.to(device, non_blocking=False)
+        
+        # Ensure backbone is on the right device
+        if hasattr(self.backbone, 'to'):
+            self.backbone = self.backbone.to(device)
+        
+        # Generate embeddings and forward pass
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
-        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(device=device, dtype=dtype)
+        
+        # Ensure all tensors are on the same device before calling backbone
+        h = h.to(device, non_blocking=False)
+        input_pos = input_pos.to(device, non_blocking=False)
+        curr_backbone_mask = curr_backbone_mask.to(device, non_blocking=False)
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            
+        # Call backbone with explicit device control
+        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
+        h = h.to(device=device, dtype=dtype, non_blocking=False)
+        
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
         last_h = h[:, -1, :].to(device)
         c0_logits = self.codebook0_head(last_h)
@@ -263,12 +323,27 @@ class Model(nn.Module):
         
         Our custom decoder doesn't use caching.
         """
+        # Get the device directly from parameters
+        device = next(self.parameters()).device
+        
         # Try to reset backbone caches if available
         # If caches are disabled, this will be a no-op
         try:
+            # Ensure backbone is on the right device
+            if hasattr(self.backbone, 'to'):
+                self.backbone = self.backbone.to(device)
+                
             if hasattr(self.backbone, 'reset_caches'):
                 self.backbone.reset_caches()
-        except Exception:
+                
+            # Force CUDA synchronization
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+                
+            # Set a flag so we know caches need to be rebuilt
+            self._caches_reset = True
+        except Exception as e:
+            print(f"Cache reset note: {e}")
             pass
     
     def validate_batch_size(self, batch_size):

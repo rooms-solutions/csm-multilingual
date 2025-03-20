@@ -107,24 +107,30 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
     # Prepare for generation - directly using the model without Generator class
     with torch.inference_mode():
         try:
-            # Create input frame
+            # Create input frame - explicitly move everything to the correct device
             seq_len = len(text_tokens)
             text_frame = torch.zeros(1, seq_len, 33, dtype=torch.long, device=device_obj)
-            text_frame[0, :, -1] = text_tensor.to(device_obj)
+            text_tensor = text_tensor.to(device_obj)
+            text_frame[0, :, -1] = text_tensor
             text_mask = torch.zeros(1, seq_len, 33, dtype=torch.bool, device=device_obj)
             text_mask[0, :, -1] = True
             
-            # Setup position indices
-            positions = torch.arange(0, seq_len, device=device_obj).unsqueeze(0)
+            # Setup position indices - explicitly on the same device
+            positions = torch.arange(0, seq_len, device=device_obj).unsqueeze(0).to(device_obj)
             
             # We'll collect audio tokens manually without the generate function
             samples = []
             
             # Reset and ensure caches are set up
+            # Force reset caches and ensure they're properly initialized
             model.reset_caches()
-            if not hasattr(model, "backbone_causal_mask"):
-                logger.info("Re-initializing caches before generation")
-                model.setup_caches(1)
+            logger.info("Re-initializing caches before generation")
+            # Always re-initialize caches with explicit batch size and device
+            model.setup_caches(1)
+            
+            # Force CUDA synchronization to ensure all ops are complete
+            if device_obj.type == 'cuda':
+                torch.cuda.synchronize(device_obj)
             
             # Get the initial state from the model
             logger.info("Starting generation...")
