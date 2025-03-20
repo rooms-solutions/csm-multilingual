@@ -67,6 +67,9 @@ logger = logging.getLogger("train_multilingual")
 def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx=0):
     """Process a single batch with minimal modifications from CSM approach"""
     
+    # Get model dtype for consistency
+    model_dtype = next(model.parameters()).dtype
+    
     # Create input format - use standard CSM approach
     b, s = text_tokens.size()
     text_frame = torch.zeros(b, s, 33, dtype=torch.long, device=device)
@@ -81,6 +84,9 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
     embeds = model._embed_tokens(text_frame)
     masked_embeds = embeds * text_frame_mask.unsqueeze(-1)
     h = masked_embeds.sum(dim=2)
+    
+    # Ensure h has the correct dtype before backbone processing
+    h = h.to(dtype=model_dtype)
 
     # Create causal mask (standard implementation)
     causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
@@ -88,6 +94,9 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
     
     # Run backbone
     backbone_output = model.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
+    
+    # CRITICAL: Ensure backbone output has correct dtype for subsequent operations
+    backbone_output = backbone_output.to(dtype=model_dtype)
     
     # Compute loss for all codebooks
     num_codebooks = audio_tokens.size(1)
@@ -100,10 +109,11 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             logits = model.codebook0_head(backbone_output[:, -1, :])
         else:
             # Subsequent codebooks through projection and decoder
-            logits = torch.matmul(
-                model.projection(backbone_output[:, -1, :].unsqueeze(1)).squeeze(1), 
-                model.audio_head[i-1]
-            )
+            projection_output = model.projection(backbone_output[:, -1, :].unsqueeze(1)).squeeze(1)
+            # Ensure consistent dtype
+            projection_output = projection_output.to(dtype=model_dtype)
+            audio_head = model.audio_head[i-1].to(dtype=model_dtype)
+            logits = torch.matmul(projection_output, audio_head)
         
         # Get target and compute loss
         target = audio_tokens[:, i].view(-1)
@@ -216,6 +226,13 @@ def train(args):
         # Verify the model has correct dtype on all parameters
         actual_dtype = next(model.parameters()).dtype
         logger.info(f"Model parameters dtype: {actual_dtype}")
+        
+        # Check if dtype matches our intended dtype
+        if actual_dtype != model_dtype:
+            logger.warning(f"Model dtype mismatch: expected {model_dtype}, got {actual_dtype}")
+            logger.info("Re-applying correct dtype to ensure consistency")
+            model = model.to(dtype=model_dtype)
+            torch.cuda.synchronize(device)
         
         # Make sure model is in training mode
         model.train()
@@ -403,6 +420,16 @@ def train(args):
             logger.info("Converting model to Float16 for guaranteed AMP compatibility")
             model = model.to(dtype=torch.float16)
             
+            # Verify all parts of the model have the correct dtype
+            for name, param in model.named_parameters():
+                if param.dtype != torch.float16:
+                    logger.warning(f"Parameter {name} has incorrect dtype {param.dtype}, fixing to float16")
+                    param.data = param.data.to(dtype=torch.float16)
+            
+            # Force synchronization to ensure all conversions are complete
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
             # Ensure optimizer is recreated after model conversion to maintain correct state
             optimizer = optim.AdamW(
                 model.parameters(),
@@ -480,6 +507,10 @@ def train(args):
                 # Handle any NaN values in loss
                 if torch.isnan(normalized_loss) or torch.isinf(normalized_loss):
                     normalized_loss = torch.tensor(1.0, device=device, dtype=torch.float16, requires_grad=True)
+                    
+                # Ensure loss has correct dtype for scaler
+                if normalized_loss.dtype != torch.float32:
+                    normalized_loss = normalized_loss.to(dtype=torch.float32)
                     
                 # Backward pass with scaling
                 scaler.scale(normalized_loss).backward()
