@@ -235,7 +235,8 @@ class Generator:
             permuted_samples = stacked_samples.permute(1, 2, 0).to(device)
                 
             # Force correct format to avoid CUDA kernel issues
-            permuted_samples = permuted_samples.contiguous().to(dtype=torch.float32)
+            # Ensure we use integer tokens which the Mimi codec expects
+            permuted_samples = permuted_samples.contiguous().to(dtype=torch.long)
                 
             # Print debug info
             print(f"Decoding with samples on device: {permuted_samples.device}")

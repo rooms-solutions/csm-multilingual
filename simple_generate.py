@@ -411,8 +411,9 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
             patching_success = patch_mimi_upsample(mimi)
             logger.info(f"Mimi patching {'succeeded' if patching_success else 'failed'}")
             
-            # Ensure input tensors have the right format
-            stacked_samples = stacked_samples.contiguous().to(dtype=torch.float32)
+            # Ensure input tensors have the right format - convert to integer tokens for Mimi
+            # The Mimi codec expects integer tokens, not float values
+            stacked_samples = stacked_samples.contiguous().to(dtype=torch.long)
             
             # Handle decoding with CUDA-compatible fallback mechanisms
             try:
@@ -433,8 +434,13 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                     with torch.no_grad():
                         # Get device and move tensor there explicitly
                         device = next(mimi.parameters()).device
-                        x = stacked_samples.to(device=device, dtype=torch.float32, non_blocking=False)
+                        # Important: Convert to float32 AFTER we've done the manual decode operations
+                        # The original codec would have done this conversion internally
+                        x = stacked_samples.to(device=device, dtype=torch.long, non_blocking=False)
                         x = x.contiguous()
+                    
+                        # Convert to float for processing operations
+                        x_float = x.to(dtype=torch.float32)
                         
                         # Basic alternative upsampling sequence
                         logger.info(f"Running alternative decode path on {device}...")
@@ -444,7 +450,7 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                         
                         # Create an upsampled version using interpolate
                         x_ups = torch.nn.functional.interpolate(
-                            x, scale_factor=16, mode='linear', align_corners=False
+                            x_float, scale_factor=16, mode='linear', align_corners=False
                         )
                         
                         # Apply a smoothing filter to reduce artifacts
@@ -500,21 +506,23 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                     try:
                         # Temporarily hide CUDA devices to force CPU-only initialization
                         os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                        
+                    
                         # Create a fresh model with CPU-only operations
                         fresh_cpu_mimi = loaders.get_mimi(fresh_mimi_weight, device=torch.device("cpu"))
                         fresh_cpu_mimi.set_num_codebooks(32)
-                        
+                    
                         # Ensure in eval mode with no grad
                         fresh_cpu_mimi.eval()
-                        
+                    
                         # Log model device to verify it's on CPU
                         logger.info(f"Fresh Mimi created on device: {next(fresh_cpu_mimi.parameters()).device}")
-                        
+                    
                         # CPU-only decode operation
                         logger.info("Decoding with CPU-only model...")
                         with torch.no_grad():
-                            audio = fresh_cpu_mimi.decode(cpu_samples.to(dtype=torch.float32))
+                            # Convert to long - Mimi codec expects integer tokens
+                            cpu_samples_long = cpu_samples.to(dtype=torch.long)
+                            audio = fresh_cpu_mimi.decode(cpu_samples_long)
                         logger.info("Successfully decoded audio using isolated CPU model")
                     finally:
                         # Restore CUDA visibility
@@ -529,6 +537,9 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                     # Fallback 2: Convert tokens directly using code table approach
                     try:
                         logger.info("Attempting mel-spectrogram approximation...")
+                        # Ensure numpy is imported
+                        import numpy as np
+                        
                         with torch.no_grad():
                             # Get token data to CPU as numpy
                             token_data = stacked_samples.detach().cpu().numpy()
