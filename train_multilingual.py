@@ -192,17 +192,27 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
         
         # For next iteration, if not the last codebook
         if i < num_codebooks - 1:
-            # Get embedding for next codebook token
+            # Get embedding for next codebook token with explicit device control
             if audio_tokens.dim() == 3:
                 token_input = audio_tokens[:, i, 0].view(-1, 1)
             else:
                 token_input = audio_tokens[:, i].view(-1, 1)
             
+            # Ensure token is on the correct device
+            token_input = token_input.to(device=device, non_blocking=False)
+            
+            # Synchronize before embedding
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                
             ci_embed = model._embed_audio(i, token_input)
             
             # Ensure consistent shape
             if ci_embed.dim() == 4:
                 ci_embed = ci_embed.squeeze(2)
+                
+            # Verify device consistency
+            ci_embed = ci_embed.to(device=device, non_blocking=False)
     
     # Normalize the loss
     normalized_loss = total_loss / num_codebooks

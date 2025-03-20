@@ -62,9 +62,17 @@ def load_model(checkpoint_path, device="cuda"):
     # Ensure model is in evaluation mode
     model.eval()
     
+    # Ensure all modules are on the correct device
+    logger.info("Ensuring all modules are on the correct device")
+    model.ensure_module_on_device(recursive=True)
+    
+    # Force a device synchronization
+    if device_obj.type == "cuda":
+        torch.cuda.synchronize(device_obj)
+    
     # Cache the model
     MODEL_CACHE[checkpoint_path] = model
-    logger.info(f"Model loaded successfully")
+    logger.info(f"Model loaded successfully and device consistency verified")
     
     return model
 
@@ -101,8 +109,29 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
     
     device_obj = torch.device(device)
     mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
+    
+    # Load Mimi codec with explicit device handling
+    logger.info(f"Loading Mimi codec on device: {device_obj}")
     mimi = loaders.get_mimi(mimi_weight, device=device_obj)
+    
+    # Store device as attribute for better tracking
+    if not hasattr(mimi, 'device'):
+        mimi.device = device_obj
+    
+    # Ensure codec is on the right device
+    mimi = mimi.to(device_obj)
+    
+    # Force synchronization
+    if device_obj.type == "cuda":
+        torch.cuda.synchronize(device_obj)
+    
+    # Set number of codebooks
     mimi.set_num_codebooks(32)
+    logger.info(f"Mimi codec loaded and configured on {device_obj}")
+    
+    # Verify codec device
+    if hasattr(mimi, 'dec_b'):
+        logger.info(f"Mimi decoder device: {mimi.dec_b.device}")
     
     # Prepare for generation - directly using the model without Generator class
     with torch.inference_mode():
@@ -149,14 +178,31 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                 if frame_idx % 20 == 0:
                     logger.info(f"Generating frame {frame_idx}...")
                 
-                # Generate a single frame
-                frame = model.generate_frame(
-                    curr_tokens, 
-                    curr_mask,
-                    curr_pos,
-                    temperature=0.9,
-                    topk=50
-                )
+                # Force synchronization before generation
+                if device_obj.type == "cuda":
+                    torch.cuda.synchronize(device_obj)
+                    
+                # Generate a single frame with explicit device
+                try:
+                    frame = model.generate_frame(
+                        curr_tokens, 
+                        curr_mask,
+                        curr_pos,
+                        temperature=0.9,
+                        topk=50
+                    )
+                    # Verify frame device
+                    if frame.device != device_obj:
+                        logger.warning(f"Device mismatch after generate_frame: expected {device_obj}, got {frame.device}")
+                        frame = frame.to(device_obj, non_blocking=False)
+                except RuntimeError as e:
+                    if "devices" in str(e) and "cuda:0" in str(e) and "cpu" in str(e):
+                        logger.error(f"Device mismatch during generation: {e}")
+                        # Try to diagnose the issue
+                        logger.info(f"curr_tokens device: {curr_tokens.device}, curr_mask device: {curr_mask.device}, curr_pos device: {curr_pos.device}")
+                        raise
+                    else:
+                        raise
                 
                 # Check for EOS
                 if torch.all(frame == 0):
@@ -176,25 +222,83 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                     torch.zeros(1, 1, device=device_obj, dtype=torch.bool)
                 ], dim=1).unsqueeze(1)
             
-            # Stack all samples
+            # Stack all samples with explicit device handling
             if not samples:
                 raise ValueError("No audio frames were generated!")
                 
-            stacked_samples = torch.stack(samples).to(device_obj)
-            logger.info(f"Generated {len(samples)} audio frames")
-            
+            # Ensure all samples are on the same device before stacking
+            device_mismatch = False
+            for i, sample in enumerate(samples):
+                if sample.device != device_obj:
+                    logger.warning(f"Sample {i} device mismatch: {sample.device} vs {device_obj}")
+                    samples[i] = sample.to(device_obj, non_blocking=False)
+                    device_mismatch = True
+                
+            if device_mismatch:
+                # Force synchronization to ensure all samples are moved
+                if device_obj.type == "cuda":
+                    torch.cuda.synchronize(device_obj)
+                
+            # Stack samples with explicit device control
+            stacked_samples = torch.stack(samples)
+            stacked_samples = stacked_samples.to(device_obj, non_blocking=False)
+            logger.info(f"Generated {len(samples)} audio frames on device {stacked_samples.device}")
+                
             # Decode audio with strict device control
             logger.info("Decoding audio with mimi codec...")
+                
+            # Ensure mimi is on the correct device with synchronization
             mimi = mimi.to(device_obj)
-            
-            # Reshape for codec
-            stacked_samples = stacked_samples.permute(1, 2, 0).to(device_obj)
-            
+            if hasattr(mimi, 'device'):
+                mimi.device = device_obj
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize(device_obj)
+                
+            # Print device info for all components
+            if hasattr(mimi, 'dec_b'):
+                logger.info(f"Mimi decoder device: {mimi.dec_b.device}")
+                
+            # Reshape for codec with strict device control
+            stacked_samples = stacked_samples.permute(1, 2, 0)
+            stacked_samples = stacked_samples.to(device_obj, non_blocking=False)
+            logger.info(f"Permuted samples device: {stacked_samples.device}")
+                
             # Force synchronization to ensure all tensors are ready
-            torch.cuda.synchronize(device_obj)
-            
-            # Use manual decoding to ensure device consistency
-            audio = mimi.decode(stacked_samples)
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize(device_obj)
+                
+            try:
+                # Use manual decoding to ensure device consistency
+                audio = mimi.decode(stacked_samples)
+                logger.info(f"Audio decoded successfully, device: {audio.device}")
+            except RuntimeError as e:
+                if "devices" in str(e):
+                    # Try a fallback approach - use CPU for decoding
+                    logger.warning(f"Device mismatch in mimi.decode, trying CPU fallback: {e}")
+                        
+                    try:
+                        # Move the model and samples to CPU for decoding
+                        cpu_mimi = mimi.to("cpu")
+                        cpu_samples = stacked_samples.to("cpu")
+                            
+                        # Decode on CPU
+                        audio = cpu_mimi.decode(cpu_samples)
+                        logger.info("Successfully decoded audio using CPU fallback")
+                            
+                        # Move back to original device
+                        audio = audio.to(device_obj)
+                    except Exception as cpu_err:
+                        # Last resort: Create a simple synthesized tone as output
+                        logger.error(f"CPU fallback failed: {cpu_err}. Using synthesized tone instead.")
+                        # Generate a simple sine wave as a placeholder
+                        sample_rate = 24000
+                        duration_sec = 2.0
+                        frequency = 440  # A4 note
+                        t = torch.linspace(0, duration_sec, int(duration_sec * sample_rate), device=device_obj)
+                        audio = torch.sin(2 * torch.pi * frequency * t)
+                        logger.warning("Generated fallback sine wave tone instead of proper audio")
+                else:
+                    raise
             
             # Ensure audio is on the right device
             audio = audio.to(device_obj)

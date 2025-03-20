@@ -126,6 +126,42 @@ class Model(nn.Module):
         self.projection = nn.Linear(backbone_dim, decoder_dim, bias=False)
         self.codebook0_head = nn.Linear(backbone_dim, args.audio_vocab_size, bias=False)
         self.audio_head = nn.Parameter(torch.empty(args.audio_num_codebooks - 1, decoder_dim, args.audio_vocab_size))
+        
+    def ensure_module_on_device(self, recursive=True):
+        """Ensures all modules and parameters are on the same device"""
+        device = next(self.parameters()).device
+        print(f"Ensuring model is on device: {device}")
+        
+        # Move the module itself
+        self.to(device)
+        
+        # Check all parameters directly owned by this module
+        for name, param in self.named_parameters(recurse=False):
+            if param.device != device:
+                print(f"Moving parameter {name} from {param.device} to {device}")
+                param.data = param.data.to(device)
+        
+        # Check all buffers
+        for name, buf in self.named_buffers(recurse=False):
+            if buf.device != device:
+                print(f"Moving buffer {name} from {buf.device} to {device}")
+                buf.data = buf.data.to(device)
+        
+        # Recursively check all child modules
+        if recursive:
+            for name, module in self.named_children():
+                if hasattr(module, 'to'):
+                    module.to(device)
+                
+                # Also move all their parameters
+                for param_name, param in module.named_parameters(recurse=True):
+                    if param.device != device:
+                        print(f"Moving {name}.{param_name} from {param.device} to {device}")
+                        param.data = param.data.to(device)
+        
+        # Force sync if CUDA
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
         """Setup caches and causal masks with consistent dimensions.
