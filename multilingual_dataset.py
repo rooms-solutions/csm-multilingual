@@ -152,6 +152,26 @@ class MultilingualVoiceDataset(Dataset):
             device = next(self.mimi.parameters()).device
             waveform_tensor = waveform.unsqueeze(0).unsqueeze(0).to(device)
             audio_tokens = self.mimi.encode(waveform_tensor)[0]
+            
+            # Verify token range is reasonable (for debugging)
+            if idx % 100 == 0:  # Log only occasionally to avoid spam
+                token_min = audio_tokens.min().item()
+                token_max = audio_tokens.max().item()
+                token_mean = audio_tokens.float().mean().item()
+                print(f"Audio tokens range: min={token_min}, max={token_max}, mean={token_mean:.2f}")
+                
+                # Validate by decoding and re-encoding a sample
+                if idx == 0:
+                    try:
+                        # Decode to audio
+                        test_audio = self.mimi.decode(audio_tokens.unsqueeze(0))
+                        # Re-encode to tokens
+                        test_tokens = self.mimi.encode(test_audio)[0]
+                        # Compare similarity
+                        print(f"Token encode-decode test: {torch.nn.functional.mse_loss(audio_tokens, test_tokens):.4f} MSE")
+                        print("✓ Mimi codec is working correctly for encoding/decoding")
+                    except Exception as e:
+                        print(f"⚠️ Mimi codec test failed: {e}")
         
         # All tensors must be on CPU for DataLoader with pin_memory
         return {

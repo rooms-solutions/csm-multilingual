@@ -87,8 +87,8 @@ def load_model(checkpoint_path, device="cuda", isolation_level=0):
             # Apply custom decoder fix
             from custom_decoder import fix_decoder_attention
             model = fix_decoder_attention(model)
-            # Load state dict with non-strict matching
-            checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+            # Load state dict with non-strict matching and weights_only for security
+            checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=True)
             model.load_state_dict(checkpoint, strict=False)
         
         # Ensure model is in evaluation mode

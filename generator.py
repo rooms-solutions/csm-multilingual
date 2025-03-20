@@ -458,59 +458,68 @@ def create_safe_mimi_wrapper(original_mimi, device="cuda"):
         safe_tokens = safe_tokens.mean(dim=2).to(torch.long)
         channels = 512
 
-        # 3. Create a direct-to-waveform converter for safety
-      # This uses a simple linear interpolation approach that's CUDA-safe
-
-      # Simple direct conversion
-      upsampling_factor = 120  # Each token expands to ~120 samples
-      audio_length = seq_len * upsampling_factor
-
-      # Create linear upsampling with CUDA-optimized operations
+      # Move tokens back to device for decoding
       safe_tokens = safe_tokens.to(self.device)
 
-      # Direct decoding - don't rely on VQ codebooks
+      # IMPORTANT CHANGE: Try original Mimi decoder FIRST
       try:
-        # Upsample using CUDA-safe interpolation
-        # Convert to float first
-        float_tokens = safe_tokens.float()
-
-        # To avoid CUDA kernel issues, normalize token values to 0-1 range
-        float_tokens = float_tokens / self.max_token
-
-        # Reshape for upsampling
-        float_tokens = float_tokens.permute(0, 2,
-                                            1)  # [B, L, C]
-
-        # Upsample efficiently with interpolate (CUDA-optimized)
-        upsampled = torch.nn.functional.interpolate(
-            float_tokens.unsqueeze(1),
-            # Add dummy channel dim [B, 1, L, C]
-            size=(audio_length, channels),
-            mode='bicubic',
-            align_corners=False
-        ).squeeze(
-          1)  # Remove dummy dim -> [B, L', C]
-
-        # Convert back to original dimensions [B, C, L']
-        upsampled = upsampled.permute(0, 2, 1)
-
-        # Normalize to avoid clipping
-        upsampled = torch.tanh(upsampled)
-
-        # Average across channels to get final audio
-        audio = upsampled.mean(dim=1, keepdim=True)
-
-        print(f"Direct decoding successful, output shape: {audio.shape}")
-        return audio
-
+        print("Using Mimi neural vocoder for decoding...")
+        return self.mimi.decode(safe_tokens)
       except Exception as e:
-        print(f"Direct decoding failed: {e}, trying original implementation")
-        # Try original mimi decode with fixed tokens as fallback
+        print(f"Mimi neural vocoder failed: {e}, falling back to direct decoding")
+        
+        # Only use direct decoding as a fallback
         try:
-          return self.mimi.decode(safe_tokens)
+          # Simple direct conversion
+          upsampling_factor = 120  # Each token expands to ~120 samples
+          audio_length = seq_len * upsampling_factor
+          
+          # Upsample using CUDA-safe interpolation
+          # Convert to float first
+          float_tokens = safe_tokens.float()
+
+          # To avoid CUDA kernel issues, normalize token values to 0-1 range
+          float_tokens = float_tokens / self.max_token
+
+          # Reshape for upsampling
+          float_tokens = float_tokens.permute(0, 2, 1)  # [B, L, C]
+
+          # Upsample efficiently with interpolate (CUDA-optimized)
+          upsampled = torch.nn.functional.interpolate(
+              float_tokens.unsqueeze(1),
+              # Add dummy channel dim [B, 1, L, C]
+              size=(audio_length, channels),
+              mode='bicubic',
+              align_corners=False
+          ).squeeze(1)  # Remove dummy dim -> [B, L', C]
+
+          # Convert back to original dimensions [B, C, L']
+          upsampled = upsampled.permute(0, 2, 1)
+
+          # Normalize to avoid clipping
+          upsampled = torch.tanh(upsampled)
+
+          # Average across channels to get final audio
+          audio = upsampled.mean(dim=1, keepdim=True)
+
+          print(f"Direct decoding fallback used, shape: {audio.shape}")
+          print(f"WARNING: Using approximation instead of neural vocoder!")
+          return audio
+          
         except Exception as e2:
-          print(f"Original decode also failed: {e2}")
-          raise e2
+          print(f"All decoding methods failed: {e2}")
+          
+          # Try using failsafe decoder as last resort
+          try:
+            from failsafe_decoder import get_failsafe_decoder
+            print("Attempting to use failsafe decoder...")
+            failsafe_decoder = get_failsafe_decoder()
+            audio = failsafe_decoder.decode(tokens)
+            print("Using failsafe decoder (will sound robotic)")
+            return audio
+          except ImportError:
+            # Re-raise original error if failsafe not available
+            raise e2
 
           # Create and return the wrapper
 
