@@ -224,6 +224,7 @@ class Model(nn.Module):
         input_pos: torch.Tensor,
         temperature: float,
         topk: int,
+        debug: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -231,6 +232,7 @@ class Model(nn.Module):
             tokens_mask: (batch_size, seq_len, audio_num_codebooks+1)
             input_pos: (batch_size, seq_len) positions for each token
             mask: (batch_size, seq_len, max_seq_len
+            debug: Whether to print debug information about devices
 
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
@@ -242,11 +244,13 @@ class Model(nn.Module):
 
         # Ensure caches are set up - create if missing
         if not hasattr(self, "backbone_causal_mask"):
-            print("Setting up caches before generation...")
+            if debug:
+                print("Setting up caches before generation...")
             self.setup_caches(b)
 
-        # Debug info
-        print(f"Parameter device: {param_device}, Input device: {tokens.device}")
+        # Debug device info (only if debug=True)
+        if debug:
+            print(f"Parameter device: {param_device}, Input device: {tokens.device}")
         
         # Ignore device mismatch when it's just "cuda" vs "cuda:0" etc.
         # as long as they're both on the same type of device (cuda or cpu)
@@ -262,6 +266,8 @@ class Model(nn.Module):
             tokens = tokens.to(device, non_blocking=False)
             tokens_mask = tokens_mask.to(device, non_blocking=False)
             input_pos = input_pos.to(device, non_blocking=False)
+            if debug:
+                print(f"Moved inputs to {device}")
         
         # Force synchronization to ensure device transfers are complete
         if device.type == "cuda":
@@ -358,9 +364,11 @@ class Model(nn.Module):
             curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=device) 
             curr_pos[:, 1] = 1
             
-        # Final device check - don't warn about "cuda" vs "cuda:0"
+        # Final device check 
         curr_sample = curr_sample.to(device)
-        print(f"Generated frame output device: {curr_sample.device}")
+        # Only print debug info if requested
+        if debug:
+            print(f"Generated frame output device: {curr_sample.device}")
         return curr_sample
 
     def reset_caches(self):

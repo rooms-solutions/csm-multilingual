@@ -182,14 +182,15 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                 if device_obj.type == "cuda":
                     torch.cuda.synchronize(device_obj)
                     
-                # Generate a single frame with explicit device
+                # Generate a single frame with explicit device (debug=False to silence device messages)
                 try:
                     frame = model.generate_frame(
                         curr_tokens, 
                         curr_mask,
                         curr_pos,
                         temperature=0.9,
-                        topk=50
+                        topk=50,
+                        debug=False
                     )
                     # Verify frame device - compare device types rather than exact strings
                     if str(frame.device).split(':')[0] != str(device_obj).split(':')[0]:
