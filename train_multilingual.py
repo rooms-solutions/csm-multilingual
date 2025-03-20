@@ -439,13 +439,11 @@ def train(args):
             
             # Set initial scale to a lower value to prevent overflow
             scaler = GradScaler(
-                'cuda', 
                 enabled=True,
                 init_scale=2**10,  # Start with smaller scale factor
                 growth_factor=1.5,  # More conservative growth
                 growth_interval=100,  # Less frequent growth
                 backoff_factor=0.5,  # More aggressive backoff
-                max_scale=2**16     # Lower max scale to avoid overflow
             )
             
             # Initialize scaler with conservative settings for stability
