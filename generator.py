@@ -274,6 +274,9 @@ class Generator:
             original_forward = module.forward
 
             def make_patched_forward(mod_name, channel_info):
+              # Store original forward method
+              original_forward = module.forward
+
               def patched_forward(self, x):
                 print(f"Intercepted problematic convtr in {mod_name}")
 
@@ -293,9 +296,16 @@ class Generator:
                                     reduction_factor, seq_len)
                       x = x.mean(dim=2)
                       print(f"Fixed channel dimension: {x.shape}")
-
-                      # Proceed with upsampling
-                return custom_upsample(x)
+                
+                # Try original forward first
+                try:
+                  # Ensure tensor is contiguous and has correct dtype
+                  x = x.contiguous().to(dtype=torch.float32)
+                  return original_forward(x)
+                except Exception as e:
+                  print(f"Original convtr failed: {e}, using custom upsampling")
+                  # Fall back to custom upsampling
+                  return custom_upsample(x)
 
               return patched_forward
 
