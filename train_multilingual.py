@@ -356,7 +356,7 @@ def train(args):
         try:
             from huggingface_hub import hf_hub_download
             logger.info("Downloading CSM-1B pretrained model...")
-            model_path = hf_hub_download("SesameAILabs/CSM-1B", "ckpt.pt")
+            model_path = hf_hub_download("sesame/csm-1b", "ckpt.pt")
             logger.info(f"Loading CSM-1B model from {model_path}")
             
             # Load pretrained state dict
