@@ -622,6 +622,10 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
                             # Convert back to torch tensor
                             audio = torch.from_numpy(audio_data).float()
                             logger.info(f"Created audio approximation with {duration_sec:.2f} seconds")
+                        except Exception as tensor_err:
+                            logger.error(f"Error creating tensor data: {tensor_err}")
+                            # Re-raise to be caught by the outer exception handler
+                            raise
                     except Exception as conversion_err:
                         logger.error(f"Token conversion failed: {conversion_err}")
                         
