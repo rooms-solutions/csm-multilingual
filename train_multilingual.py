@@ -601,8 +601,8 @@ def train(args):
                     # Step with scaler
                     scaler.step(optimizer)
                     scaler.update()
-                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()  # Moved after optimizer steps
             else:
                 # Standard training path
                 normalized_loss.backward()
@@ -611,8 +611,8 @@ def train(args):
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1 == len(train_loader)):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     optimizer.step()
-                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()  # Moved after optimizer steps
                 
             # Force synchronization after parameter updates
             if torch.cuda.is_available() and ((batch_idx + 1) % args.gradient_accumulation_steps == 0):

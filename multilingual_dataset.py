@@ -167,8 +167,11 @@ class MultilingualVoiceDataset(Dataset):
                         test_audio = self.mimi.decode(audio_tokens.unsqueeze(0))
                         # Re-encode to tokens
                         test_tokens = self.mimi.encode(test_audio)[0]
+                        # Convert to float before computing MSE
+                        audio_tokens_float = audio_tokens.float()
+                        test_tokens_float = test_tokens.float()
                         # Compare similarity
-                        print(f"Token encode-decode test: {torch.nn.functional.mse_loss(audio_tokens, test_tokens):.4f} MSE")
+                        print(f"Token encode-decode test: {torch.nn.functional.mse_loss(audio_tokens_float, test_tokens_float):.4f} MSE")
                         print("✓ Mimi codec is working correctly for encoding/decoding")
                     except Exception as e:
                         print(f"⚠️ Mimi codec test failed: {e}")
