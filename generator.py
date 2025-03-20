@@ -177,3 +177,31 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
 
     generator = Generator(model)
     return generator
+
+
+def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
+    """Load a multilingual model with compatibility for custom decoder attention"""
+    model_args = ModelArgs(
+        backbone_flavor="llama-1B",
+        decoder_flavor="llama-100M",
+        text_vocab_size=128256,
+        audio_vocab_size=2051,
+        audio_num_codebooks=32,
+    )
+    
+    # Create model with correct dtype from the start
+    model = Model(model_args).to(device=device, dtype=torch.bfloat16)
+    
+    # Apply the same custom decoder fix used during training
+    from custom_decoder import fix_decoder_attention
+    model = fix_decoder_attention(model)
+    
+    # Load state dict with some forgiveness for mismatched keys
+    state_dict = torch.load(ckpt_path, map_location=device)
+    
+    # Try loading with strict=False to ignore missing/unexpected keys
+    model.load_state_dict(state_dict, strict=False)
+    print("Model loaded with adjusted decoder attention architecture")
+    
+    generator = Generator(model)
+    return generator
