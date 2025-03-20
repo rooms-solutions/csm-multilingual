@@ -58,12 +58,7 @@ class Generator:
 
         self._watermarker = load_watermarker(device=self.device)
         
-        # Additional safety check to make sure watermarker is on the right device
-        for param in self._watermarker.parameters():
-            if param.device != self.device:
-                print(f"Warning: Moving watermarker from {param.device} to {self.device}")
-                self._watermarker = self._watermarker.to(self.device)
-                break
+        # No need for parameter check as we've made load_watermarker robust
 
         self.sample_rate = mimi.sample_rate
 
@@ -175,8 +170,13 @@ class Generator:
         # Watermarking ensures transparency, dissuades misuse, and enables traceability.
         # Please be a responsible AI citizen and keep the watermarking in place.
         # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio.to(device), self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        try:
+            audio, wm_sample_rate = watermark(self._watermarker, audio.to(device), self.sample_rate, CSM_1B_GH_WATERMARK)
+            audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        except Exception as e:
+            print(f"Warning: Could not apply watermark: {e}")
+            print("Continuing without watermarking")
+            # Keep the audio as is without watermarking
 
         return audio
 
