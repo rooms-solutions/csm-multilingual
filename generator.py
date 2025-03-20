@@ -424,6 +424,16 @@ def create_safe_mimi_wrapper(original_mimi, device="cuda"):
         # Conservative fallback
         self.max_token = 2000
       print(f"Safe Mimi wrapper created with max token value: {self.max_token}")
+    
+    def named_modules(self):
+      """Pass through named_modules calls to the wrapped mimi model"""
+      if hasattr(self.mimi, 'named_modules'):
+        return self.mimi.named_modules()
+      return []
+      
+    def parameters(self):
+      """Pass through parameters calls to the wrapped mimi model"""
+      return self.mimi.parameters()
 
     def encode(self, audio):
       """Pass through to original encoder"""
