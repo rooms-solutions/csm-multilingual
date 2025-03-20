@@ -197,10 +197,37 @@ class Generator:
         """Custom upsampling that uses interpolate instead of conv_transpose1d"""
         # Force correct format and contiguity
         x = x.contiguous().to(dtype=torch.float32)
+        
+        # Store original dimensions for better handling
+        batch_size, channels, seq_len = x.shape
+        
         # Use interpolate which has better CUDA compatibility
-        result = torch.nn.functional.interpolate(
-            x, scale_factor=2, mode='linear', align_corners=False
-        )
+        try:
+          # Use recommended interpolation with fewer artifacts
+          result = torch.nn.functional.interpolate(
+              x, scale_factor=2, mode='linear', align_corners=False
+          )
+          
+          # Apply a light smoothing to reduce artifacts
+          if channels <= 512:  # Only for manageable channel counts
+            kernel_size = min(5, seq_len // 10)
+            if kernel_size % 2 == 0:  # Ensure odd kernel size
+              kernel_size += 1
+            if kernel_size > 1:
+              padding = kernel_size // 2
+              # Create simple 1D smoothing filter
+              weight = torch.ones(channels, 1, kernel_size, device=x.device) / kernel_size
+              result = torch.nn.functional.conv1d(
+                  result, weight, padding=padding, groups=channels
+              )
+        except RuntimeError as e:
+          # Most basic fallback for any errors
+          print(f"Enhanced upsampling failed: {e}, using basic method")
+          # Create a simple 2x upsampled tensor via reshape + repeat
+          x_flat = x.reshape(batch_size * channels, 1, seq_len)
+          result = x_flat.repeat_interleave(2, dim=2)
+          result = result.reshape(batch_size, channels, seq_len * 2)
+          
         return result
 
         # Define a mapping of layer names to expected input channel counts
