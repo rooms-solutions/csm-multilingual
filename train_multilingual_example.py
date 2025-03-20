@@ -142,6 +142,12 @@ def train_language(args, language):
         
     if args.stable_training:
         cmd.append("--stable_training")
+        
+    if args.use_csm_pretrained:
+        cmd.append("--use_csm_pretrained")
+        
+    if args.freeze_backbone:
+        cmd.append("--freeze_backbone")
     
     # Add gradient accumulation and num_workers if specified
     if args.gradient_accumulation_steps > 1:
@@ -218,6 +224,12 @@ def main():
                         help="Use previous checkpoints when available")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging output")
+                        
+    # CSM pretrained model options
+    parser.add_argument("--use_csm_pretrained", action="store_true",
+                        help="Use CSM-1B pretrained weights as base model")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Freeze backbone parameters to preserve CSM-1B capabilities")
     
     args = parser.parse_args()
     
