@@ -116,7 +116,7 @@ def process_batch(model, text_tokens, audio_tokens, device, args=None, batch_idx
             logits = torch.matmul(projection_output, audio_head)
         
         # Get target and compute loss
-        target = audio_tokens[:, i].view(-1)
+        target = audio_tokens[:, i].reshape(-1)
         loss = torch.nn.functional.cross_entropy(logits, target)
         total_loss += loss
     
