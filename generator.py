@@ -221,6 +221,11 @@ class Generator:
             audio_tokens = audio_tokens.unsqueeze(0) 
             print(f"Final audio token shape before decode: {audio_tokens.shape}")
             
+            # Apply special German model adapter if needed
+            # This handles the 512 → 64 channel conversion
+            if audio_tokens.shape[1] == 512 or audio_tokens.shape[1] == 32:
+                audio_tokens = reshape_tokens_for_german_model(audio_tokens)
+            
             # Decode directly without patching or fallbacks
             try:
                 audio = self._audio_tokenizer.decode(audio_tokens)
