@@ -207,9 +207,10 @@ class Generator:
     audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
     print(f"Audio token shape after permute: {audio_tokens.shape}")
 
-    # Hard check for expected dimensions
-    if audio_tokens.shape[0] != 32:  # Check number of codebooks
-        raise ValueError(f"Expected 32 codebooks but got {audio_tokens.shape[0]}. The model architecture is incompatible.")
+    # Modern CSM ordering is [batch, codebooks, seq_len], which is what we have here
+    # Correct shape is now [1, 32, sequence_length]
+    if audio_tokens.shape[1] != 32:  # Check codebooks are in dimension 1
+        raise ValueError(f"Expected 32 codebooks in dimension 1 but got {audio_tokens.shape[1]}. The model architecture is incompatible.")
 
     # Convert to exactly 64 channels as expected by Mimi
     # Do a direct reshape that preserves all information from original tokens
