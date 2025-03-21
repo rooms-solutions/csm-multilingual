@@ -216,10 +216,8 @@ class Generator:
     # Do a direct reshape that preserves all information from original tokens
     # This is the critical fix - proper handling of the channel dimension
     try:
-        if audio_tokens.shape[0] == 32:
-            # Correctly format as [batch=1, channels=32, seq_len]
-            # This matches the format CSM uses for decoding
-            audio_tokens = audio_tokens.unsqueeze(0) 
+        if audio_tokens.shape[1] == 32:
+            # Audio tokens already in format [batch=1, codebooks=32, seq_len]
             print(f"Final audio token shape before decode: {audio_tokens.shape}")
             
             # Apply special German model adapter if needed
