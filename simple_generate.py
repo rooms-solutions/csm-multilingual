@@ -332,6 +332,12 @@ def synthesize_audio(text, language_code, model_path, output_path, device="cuda"
             stacked_samples = torch.stack(samples)
             stacked_samples = stacked_samples.to(device_obj, non_blocking=False)
             logger.info(f"Generated {len(samples)} audio frames on device {stacked_samples.device}")
+            
+            # Check if we need to limit generation length
+            max_frames = 300  # About 6 seconds of audio at typical frame rate
+            if len(samples) > max_frames:
+                logger.warning(f"Limiting excessive generation length from {len(samples)} to {max_frames} frames")
+                stacked_samples = stacked_samples[:max_frames]
                 
             # Decode audio with strict device control
             logger.info("Decoding audio with mimi codec...")
