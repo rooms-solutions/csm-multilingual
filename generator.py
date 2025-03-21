@@ -214,25 +214,26 @@ class Generator:
     # Convert to exactly 64 channels as expected by Mimi
     # Do a direct reshape that preserves all information from original tokens
     # This is the critical fix - proper handling of the channel dimension
-    if audio_tokens.shape[0] == 32:
-        # Correctly format as [batch=1, channels=32, seq_len]
-        # This matches the format CSM uses for decoding
-        audio_tokens = audio_tokens.unsqueeze(0) 
-        print(f"Final audio token shape before decode: {audio_tokens.shape}")
-        
-        # Decode directly without patching or fallbacks
-        try:
-            audio = self._audio_tokenizer.decode(audio_tokens)
-            audio = audio.squeeze(0).squeeze(0)
-            print(f"Successfully decoded audio with shape: {audio.shape}")
-        except Exception as e:
-            # Provide clear error without fallbacks
-            raise RuntimeError(f"Audio decoding failed with error: {e}. The model may need retraining with a compatible architecture.") from e
-    else:
-        raise ValueError(f"Unexpected token dimensions: {audio_tokens.shape}. Cannot produce clear audio with this format.")
+    try:
+        if audio_tokens.shape[0] == 32:
+            # Correctly format as [batch=1, channels=32, seq_len]
+            # This matches the format CSM uses for decoding
+            audio_tokens = audio_tokens.unsqueeze(0) 
+            print(f"Final audio token shape before decode: {audio_tokens.shape}")
+            
+            # Decode directly without patching or fallbacks
+            try:
+                audio = self._audio_tokenizer.decode(audio_tokens)
+                audio = audio.squeeze(0).squeeze(0)
+                print(f"Successfully decoded audio with shape: {audio.shape}")
+            except Exception as e:
+                # Provide clear error without fallbacks
+                raise RuntimeError(f"Audio decoding failed with error: {e}. The model may need retraining with a compatible architecture.") from e
+        else:
+            raise ValueError(f"Unexpected token dimensions: {audio_tokens.shape}. Cannot produce clear audio with this format.")
     except Exception as e:
-      print(f"Error during audio decode: {e}")
-      raise e
+        print(f"Error during audio decode: {e}")
+        raise e
 
     # Watermarking
     try:
@@ -321,4 +322,4 @@ def create_safe_mimi_wrapper(original_mimi, device="cuda"):
             # Tokens should be in format [batch, codebooks, seq_len]
             return self.mimi.decode(tokens)
         
-  return MinimalMimiWrapper(original_mimi, device)
+    return SimpleCSMCompatibleMimi(original_mimi, device)
