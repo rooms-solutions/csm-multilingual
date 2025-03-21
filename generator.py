@@ -190,332 +190,46 @@ class Generator:
 
     # Custom patching for CUDA compatibility
     def patch_mimi_upsample(mimi_model):
-      """Patch Mimi model's upsampling to avoid CUDA compatibility issues"""
-
-      # Define custom upsampling that stays on CUDA but avoids transpose conv issues
-      def custom_upsample(x, scale_factor=2):
-        """Custom upsampling that uses interpolate instead of conv_transpose1d"""
-        # Force correct format and contiguity
-        x = x.contiguous().to(dtype=torch.float32)
-        
-        # Store original dimensions for better handling
-        batch_size, channels, seq_len = x.shape
-        
-        # Use interpolate which has better CUDA compatibility
-        try:
-          # Use recommended interpolation with fewer artifacts
-          result = torch.nn.functional.interpolate(
-              x, scale_factor=scale_factor, mode='linear', align_corners=False
-          )
-          
-          # Use different smoothing approaches depending on channel count
-          if channels <= 512:  # For manageable channel counts
-            # More sophisticated smoothing with learned-like filtering
-            kernel_size = min(7, seq_len // 8)
-            if kernel_size % 2 == 0:  # Ensure odd kernel size
-              kernel_size += 1
-              
-            if kernel_size > 1:
-              padding = kernel_size // 2
-              
-              # Create a smoothing filter that better preserves audio characteristics
-              # Use a Hann window for better frequency response
-              window = torch.hann_window(kernel_size, device=x.device).reshape(1, 1, kernel_size)
-              weight = window.repeat(channels, 1, 1)
-              weight = weight / weight.sum(dim=2, keepdim=True)  # Normalize
-              
-              # Apply filter with grouped convolution for efficiency
-              result = torch.nn.functional.conv1d(
-                  result, weight, padding=padding, groups=channels
-              )
-          
-          # For high channel counts, use simpler method
-          elif channels > 512:
-            # Use a simpler filter for very high-dimensional data
-            kernel_size = 3
-            padding = 1
-            weight = torch.ones(channels, 1, kernel_size, device=x.device) / kernel_size
-            result = torch.nn.functional.conv1d(
-                result, weight, padding=padding, groups=channels
-            )
-            
-        except RuntimeError as e:
-          # Most basic fallback for any errors
-          print(f"Enhanced upsampling failed: {e}, using basic method")
-          # Create a simple upsampled tensor via reshape + repeat
-          x_flat = x.reshape(batch_size * channels, 1, seq_len)
-          result = x_flat.repeat_interleave(scale_factor, dim=2)
-          result = result.reshape(batch_size, channels, seq_len * scale_factor)
-          
-        return result
-
-        # Define a mapping of layer names to expected input channel counts
-
-      # This maps the layer name to (input_channels, expected_channels)
-      layer_channel_map = {
-        "decoder.model.2.convtr": (1024, 512),
-        "decoder.model.5.convtr": (512, 256),
-        "decoder.model.8.convtr": (256, 128),
-        "decoder.model.11.convtr": (128, 64),
-        "upsample.convtr": (64, 32),
-      }
-
-      # Helper function to identify transposed convolutions
-      def is_transposed_conv(module, name):
-          """Check if a module is a transposed convolution or behaves like one"""
-          # Direct class check
-          if isinstance(module, torch.nn.ConvTranspose1d):
-              return True
-              
-          # Name-based heuristics
-          if 'convtr' in name.lower() or 'transpose' in name.lower():
-              return True
-              
-          # Weight shape check - transposed convs typically have weight with in_channels first
-          if hasattr(module, 'weight') and len(module.weight.shape) == 3:
-              weight = module.weight
-              # ConvTranspose1d has weight [in_channels, out_channels, kernel]
-              # If in_channels > out_channels, likely a transposed conv
-              if weight.shape[0] > weight.shape[1]:
-                  return True
-                  
-          return False
-      
-      # Apply the patch to various components in the Mimi model
-      try:
-        # Patch primary upsampling method if available
-        if hasattr(mimi_model, '_to_encoder_framerate'):
-          original_method = mimi_model._to_encoder_framerate
-
-          def patched_to_encoder_framerate(x):
-            """Patched version of _to_encoder_framerate"""
-            # Skip the original upsample and just do interpolation
-            x = x.contiguous().to(dtype=torch.float32)
-            return custom_upsample(x)
-
-            # Replace the method
-
-          mimi_model._to_encoder_framerate = patched_to_encoder_framerate
-          print("Successfully patched Mimi codec upsampling method")
-
-          # Also patch any internal modules with convtr in their name
-        for name, module in mimi_model.named_modules():
-          # Skip any non-important or nested modules
-          if 'convtr' in name.lower() or isinstance(module,
-                                                    torch.nn.ConvTranspose1d):
-            # Get correct channel dimensions for this layer if available
-            channel_info = None
-            for layer_prefix, channel_dims in layer_channel_map.items():
-              if layer_prefix in name:
-                channel_info = channel_dims
-                break
-
-                # Replace this module's forward to use our custom implementation
-            original_forward = module.forward
-
-            def make_patched_forward(mod_name, channel_info):
-              # Store original forward method and check if this is a transposed convolution
-              original_forward = module.forward
-              is_transposed = isinstance(module, torch.nn.ConvTranspose1d) or ".convtr" in mod_name
-              
-              # Extract actual weight dimensions for transposed convolutions
-              if is_transposed and hasattr(module, 'weight'):
-                  weight_shape = module.weight.shape
-                  # For transposed conv: weight is [in_channels, out_channels, kernel]
-                  in_channels, out_channels, kernel_size = weight_shape
-                  stride = getattr(module, 'stride', (1,))[0]
-                  padding = getattr(module, 'padding', (0,))[0]
-                  output_padding = getattr(module, 'output_padding', (0,))[0]
-              elif channel_info is not None:
-                  in_channels, out_channels = channel_info
-              else:
-                  in_channels, out_channels = None, None
-
-              def patched_forward(self, x):
-                print(f"Intercepted problematic convtr in {mod_name}")
-                
-                batch_size, current_channels, seq_len = x.shape
-                
-                # Special handling for transposed convolutions
-                if is_transposed and hasattr(module, 'weight'):
-                    # For transposed conv, we need to EXPAND channels (opposite of normal conv)
-                    if current_channels != in_channels:
-                        print(f"Transposed conv channel mismatch: input has {current_channels}, need {in_channels}")
-                        
-                        if current_channels == out_channels:
-                            # Input has the output channel count, need to expand to in_channels
-                            # Create a channel expansion matrix for proper upsampling
-                            expansion_factor = in_channels // current_channels
-                            if expansion_factor > 1:
-                                # Create a learned-like expansion that distributes evenly
-                                expanded = torch.zeros(batch_size, in_channels, seq_len, 
-                                                      device=x.device, dtype=x.dtype)
-                                
-                                # Duplicate each channel multiple times with slight variations
-                                for i in range(current_channels):
-                                    for j in range(expansion_factor):
-                                        factor = 1.0 - 0.01 * j  # Slight variation to avoid exact duplication
-                                        expanded[:, i*expansion_factor + j, :] = x[:, i, :] * factor
-                                
-                                x = expanded
-                                print(f"Expanded channels: {current_channels} → {in_channels}")
-                
-                # For regular convolutions - normal dimension reduction
-                elif channel_info is not None and not is_transposed:
-                    input_channels, expected_channels = channel_info
-                    current_channels = x.size(1)
-
-                    # Only apply the fix if we have the specific mismatch
-                    if current_channels == input_channels and input_channels != expected_channels:
-                        # Calculate the reduction factor
-                        reduction_factor = input_channels // expected_channels
-                        if reduction_factor > 1:
-                            batch_size, channels, seq_len = x.shape
-                            # Reshape and average groups of channels
-                            x = x.reshape(batch_size, expected_channels,
-                                        reduction_factor, seq_len)
-                            x = x.mean(dim=2)
-                            print(f"Fixed channel dimension: {x.shape}")
-                
-                # Try original forward first
-                try:
-                    # Ensure tensor is contiguous and has correct dtype
-                    x = x.contiguous().to(dtype=torch.float32)
-                    return original_forward(x)
-                except Exception as e:
-                    print(f"Original convtr failed: {e}, using custom upsampling")
-                    
-                    # Better fallback for transposed convolutions
-                    if is_transposed and hasattr(module, 'weight'):
-                        try:
-                            # First upsample by the stride factor
-                            x_up = torch.nn.functional.interpolate(
-                                x, scale_factor=stride, mode='linear', align_corners=False
-                            )
-                            
-                            # Then apply a regular convolution as an approximation
-                            if hasattr(module, 'weight'):
-                                # Create a simpler weight that preserves some structure
-                                # Using a low-pass filter approximation
-                                kernel_width = min(kernel_size, 5)  # Simpler kernel
-                                simple_weight = torch.zeros(
-                                    out_channels, in_channels, kernel_width, 
-                                    device=x.device, dtype=torch.float32
-                                )
-                                
-                                # Fill with a triangular filter
-                                for i in range(kernel_width):
-                                    val = 1.0 - abs(i - kernel_width/2) / (kernel_width/2)
-                                    simple_weight[:, :, i] = val
-                                
-                                # Normalize weights
-                                simple_weight = simple_weight / simple_weight.sum(dim=2, keepdim=True)
-                                
-                                # Apply convolution with padding to preserve dimensions
-                                padding_val = kernel_width // 2
-                                result = torch.nn.functional.conv1d(
-                                    x_up, simple_weight, stride=1, padding=padding_val
-                                )
-                                
-                                return result
-                        except Exception as adv_e:
-                            print(f"Advanced fallback failed: {adv_e}")
-                    
-                    # Standard fallback - simple upsampling
-                    return custom_upsample(x)
-
-              return patched_forward
-
-              # Bind the new method
-
-            import types
-            module.forward = types.MethodType(
-              make_patched_forward(name, channel_info), module)
-            print(f"Patched conv_transpose1d in {name}")
-
+        """Disable any patching and use the Mimi model directly as designed"""
+        print("Using direct Mimi codec architecture without patching")
         return True
-      except Exception as e:
-        print(f"Error during patching: {e}")
-        return False
 
-    # Apply the patch to the audio tokenizer
-    print("Applying CUDA-compatible patches to audio tokenizer...")
-    patch_success = patch_mimi_upsample(self._audio_tokenizer)
-    print(f"Patching {'succeeded' if patch_success else 'failed'}")
+    # Get the device of the Mimi model and ensure tensor is on the same device
+    device = self.device
+    print(f"Decoding audio on device: {device}")
 
-    # Critical fix: Ensure audio tokenizer decode preserves device
-    try:
-      # Set the mimi model to the correct device first
-      if hasattr(self._audio_tokenizer, 'to'):
-        self._audio_tokenizer = self._audio_tokenizer.to(device)
+    # Prepare audio tokens for decoding
+    # Get exact shapes for debugging
+    b, c, s = stacked_samples.shape
+    print(f"Audio token shape before permute: {stacked_samples.shape}")
 
-      # Use permute to correctly transform the stacked samples
-      permuted_samples = stacked_samples.permute(1, 2, 0).to(device)
+    # Correctly format tokens for Mimi decoder
+    audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
+    print(f"Audio token shape after permute: {audio_tokens.shape}")
 
-      # Force correct format to avoid CUDA kernel issues
-      # Ensure we use integer tokens which the Mimi codec expects
-      permuted_samples = permuted_samples.contiguous().to(dtype=torch.long)
-      
-      # Apply safety preprocessing to avoid CUDA assertion failures
-      batch_size, channels, seq_len = permuted_samples.shape
+    # Hard check for expected dimensions
+    if audio_tokens.shape[0] != 32:  # Check number of codebooks
+        raise ValueError(f"Expected 32 codebooks but got {audio_tokens.shape[0]}. The model architecture is incompatible.")
 
-      # 1. Clamp token values to avoid index out of bounds errors
-      max_token = getattr(self._audio_tokenizer, 'max_token', self.max_token_value)
-      permuted_samples = torch.clamp(permuted_samples, min=0, max=max_token)
-
-      # 2. Fix the channel dimension mismatch for Mimi compatibility
-      expected_mimi_channels = 64  # Mimi expects 64 channels at upsampling
-      
-      if channels == 1024:
-          print(f"Fixing large channel dimension mismatch: reshaping {permuted_samples.shape}")
-          # Convert to 512 channels as intermediate step
-          permuted_samples = permuted_samples.reshape(batch_size, 512, 2, seq_len)
-          permuted_samples = permuted_samples.mean(dim=2).to(dtype=torch.long)
-          channels = 512
-          print(f"Intermediate shape after fix: {permuted_samples.shape}")
-      
-      # Handle 512 to 64 channel conversion (common mismatch)
-      if channels == 512:
-          print(f"Converting 512 channels to {expected_mimi_channels} for Mimi compatibility")
-          # Reshape from [batch, 512, seq_len] to [batch, 64, seq_len*8]
-          # This preserves the total number of values while matching expected channels
-          try:
-              # Method 1: Average groups of 8 channels
-              permuted_samples = permuted_samples.reshape(batch_size, expected_mimi_channels, 8, seq_len)
-              permuted_samples = permuted_samples.mean(dim=2).to(dtype=torch.long)
-          except RuntimeError:
-              # Method 2: More flexible reshaping that handles odd dimensions
-              print("Using alternative channel dimension conversion")
-              # Take subset of channels and expand sequence length
-              permuted_samples = permuted_samples[:, :expected_mimi_channels, :]
-              permuted_samples = torch.nn.functional.interpolate(
-                  permuted_samples.float(), 
-                  scale_factor=(1, 8),
-                  mode='nearest'
-              ).to(dtype=torch.long)
-          
-          print(f"New shape after Mimi compatibility fix: {permuted_samples.shape}")
-
-      # Print debug info
-      print(f"Decoding with samples on device: {permuted_samples.device}")
-      print(
-        f"Audio tokenizer on device: {next(self._audio_tokenizer.parameters()).device}")
-
-      try:
-        # Decode with CUDA optimizations
-        with torch.amp.autocast('cuda', enabled=False):
-          # Decode the audio
-          audio = self._audio_tokenizer.decode(permuted_samples)
-      except Exception as e:
-        print(f"Error during audio decode: {e}")
-        # Don't attempt fallbacks, just raise the exception
-        raise e
-
-      # Immediately move result to correct device and reshape
-      audio = audio.to(device)
-      audio = audio.squeeze(0).squeeze(0).to(device)
-
-      print(f"After decode, audio on device: {audio.device}")
+    # Convert to exactly 64 channels as expected by Mimi
+    # Do a direct reshape that preserves all information from original tokens
+    # This is the critical fix - proper handling of the channel dimension
+    if audio_tokens.shape[0] == 32:
+        # Correctly format as [batch=1, channels=32, seq_len]
+        # This matches the format CSM uses for decoding
+        audio_tokens = audio_tokens.unsqueeze(0) 
+        print(f"Final audio token shape before decode: {audio_tokens.shape}")
+        
+        # Decode directly without patching or fallbacks
+        try:
+            audio = self._audio_tokenizer.decode(audio_tokens)
+            audio = audio.squeeze(0).squeeze(0)
+            print(f"Successfully decoded audio with shape: {audio.shape}")
+        except Exception as e:
+            # Provide clear error without fallbacks
+            raise RuntimeError(f"Audio decoding failed with error: {e}. The model may need retraining with a compatible architecture.") from e
+    else:
+        raise ValueError(f"Unexpected token dimensions: {audio_tokens.shape}. Cannot produce clear audio with this format.")
     except Exception as e:
       print(f"Error during audio decode: {e}")
       raise e
@@ -589,38 +303,22 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
 
 
 def create_safe_mimi_wrapper(original_mimi, device="cuda"):
-  """Create a minimal wrapper that preserves CSM functionality"""
-  
-  class MinimalMimiWrapper:
-    def __init__(self, mimi, device):
-      self.mimi = mimi
-      self.device = device
-      # Get max token value (needed for safety)
-      if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
-        self.max_token = mimi.vq.codebook_size - 1
-      else:
-        self.max_token = 2000
-          
-    def named_modules(self):
-      return self.mimi.named_modules()
-        
-    def parameters(self):
-      return self.mimi.parameters()
-        
-    def encode(self, audio):
-      return self.mimi.encode(audio)
-        
-    def decode(self, tokens):
-      # Minimal safety preprocessing
-      tokens = torch.clamp(tokens, min=0, max=self.max_token)
-        
-      # Fix channel dimensions if needed (common issue)
-      batch_size, channels, seq_len = tokens.shape
-      if channels == 1024:
-        tokens = tokens.reshape(batch_size, 512, 2, seq_len)
-        tokens = tokens.mean(dim=2).to(dtype=torch.long)
-        
-      # Use original mimi decoder - no custom upsampling
-      return self.mimi.decode(tokens)
+    """Create a minimal wrapper for Mimi codec that follows CSM approach"""
+    
+    class SimpleCSMCompatibleMimi:
+        def __init__(self, mimi, device):
+            self.mimi = mimi
+            self.device = device
+            
+        def parameters(self):
+            return self.mimi.parameters()
+            
+        def encode(self, audio):
+            return self.mimi.encode(audio)
+            
+        def decode(self, tokens):
+            # Direct decoding without any fallbacks or fixes
+            # Tokens should be in format [batch, codebooks, seq_len]
+            return self.mimi.decode(tokens)
         
   return MinimalMimiWrapper(original_mimi, device)
