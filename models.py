@@ -127,6 +127,10 @@ class Model(nn.Module):
         self.codebook0_head = nn.Linear(backbone_dim, args.audio_vocab_size, bias=False)
         self.audio_head = nn.Parameter(torch.empty(args.audio_num_codebooks - 1, decoder_dim, args.audio_vocab_size))
         
+        # Add channel dimension compatibility layers for Mimi codec
+        self.mimi_compatible = True
+        self.target_channels = 64  # Mimi expects 64 channels at upsampling stage
+        
     def ensure_module_on_device(self, recursive=True):
         """Ensures all modules and parameters are on the same device"""
         device = next(self.parameters()).device

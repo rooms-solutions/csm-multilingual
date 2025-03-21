@@ -89,11 +89,12 @@ def generate_audio(
     device = generator.device
     print(f"Using device for generation: {device}")
     
-    # Generate audio
+    # Generate audio with maximum length constraint
     audio = generator.generate(
         text=processed_text,
         speaker=speaker_id,
         context=[],  # No context for now
+        max_audio_length_ms=10000,  # Limit to 10 seconds max
         temperature=temperature,
         topk=topk,
     )

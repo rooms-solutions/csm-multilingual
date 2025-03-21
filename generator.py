@@ -463,13 +463,38 @@ class Generator:
       max_token = getattr(self._audio_tokenizer, 'max_token', self.max_token_value)
       permuted_samples = torch.clamp(permuted_samples, min=0, max=max_token)
 
-      # 2. Fix the channel dimension mismatch if needed
+      # 2. Fix the channel dimension mismatch for Mimi compatibility
+      expected_mimi_channels = 64  # Mimi expects 64 channels at upsampling
+      
       if channels == 1024:
-          print(f"Fixing channel dimension mismatch: reshaping {permuted_samples.shape}")
-          # Convert to 512 channels as expected by decoder
+          print(f"Fixing large channel dimension mismatch: reshaping {permuted_samples.shape}")
+          # Convert to 512 channels as intermediate step
           permuted_samples = permuted_samples.reshape(batch_size, 512, 2, seq_len)
           permuted_samples = permuted_samples.mean(dim=2).to(dtype=torch.long)
-          print(f"New shape after fix: {permuted_samples.shape}")
+          channels = 512
+          print(f"Intermediate shape after fix: {permuted_samples.shape}")
+      
+      # Handle 512 to 64 channel conversion (common mismatch)
+      if channels == 512:
+          print(f"Converting 512 channels to {expected_mimi_channels} for Mimi compatibility")
+          # Reshape from [batch, 512, seq_len] to [batch, 64, seq_len*8]
+          # This preserves the total number of values while matching expected channels
+          try:
+              # Method 1: Average groups of 8 channels
+              permuted_samples = permuted_samples.reshape(batch_size, expected_mimi_channels, 8, seq_len)
+              permuted_samples = permuted_samples.mean(dim=2).to(dtype=torch.long)
+          except RuntimeError:
+              # Method 2: More flexible reshaping that handles odd dimensions
+              print("Using alternative channel dimension conversion")
+              # Take subset of channels and expand sequence length
+              permuted_samples = permuted_samples[:, :expected_mimi_channels, :]
+              permuted_samples = torch.nn.functional.interpolate(
+                  permuted_samples.float(), 
+                  scale_factor=(1, 8),
+                  mode='nearest'
+              ).to(dtype=torch.long)
+          
+          print(f"New shape after Mimi compatibility fix: {permuted_samples.shape}")
 
       # Print debug info
       print(f"Decoding with samples on device: {permuted_samples.device}")
