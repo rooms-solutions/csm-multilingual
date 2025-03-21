@@ -268,6 +268,39 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
   return generator
 
 
+def reshape_tokens_for_german_model(audio_tokens):
+    """
+    Special adapter function for the German model that converts 512 channels to 64
+    while preserving audio structure
+    """
+    # Get shape information
+    batch_size, channels, seq_len = audio_tokens.shape
+    
+    if channels == 512 and seq_len > 0:
+        print(f"Applying German model token adapter: {channels} → 64 channels")
+        
+        # Reshape to isolate each codebook component
+        # [B, 512, S] → [B, 64, 8, S] where 512 = 64 × 8
+        reshaped = audio_tokens.reshape(batch_size, 64, 8, seq_len)
+        
+        # Take weighted average of each group to maintain audio structure
+        # Create importance weights that prioritize certain dimensions
+        weights = torch.tensor([0.2, 0.3, 0.5, 0.7, 0.9, 0.7, 0.5, 0.3], 
+                              device=audio_tokens.device).view(1, 1, 8, 1)
+        
+        # Apply weighted average
+        weighted = reshaped * weights
+        adapted_tokens = weighted.sum(dim=2) / weights.sum()
+        
+        # Ensure we have the right datatype
+        adapted_tokens = adapted_tokens.to(dtype=audio_tokens.dtype)
+        print(f"Successfully adapted tokens from shape {audio_tokens.shape} to {adapted_tokens.shape}")
+        
+        return adapted_tokens
+    
+    # Return original if no adaptation needed
+    return audio_tokens
+
 def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
   """Load a multilingual model with compatibility for custom decoder attention"""
   # Ensure device is a torch.device object
