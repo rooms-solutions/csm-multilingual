@@ -217,9 +217,10 @@ class Generator:
         print(f"Reshaped to {audio_tokens.shape} for Mimi compatibility")
 
     # Decode directly without patching
-    audio = self._audio_tokenizer.decode(audio_tokens)
-    audio = audio.squeeze(0).squeeze(0)
-    print(f"Successfully decoded audio with shape: {audio.shape}")
+    try:
+        audio = self._audio_tokenizer.decode(audio_tokens)
+        audio = audio.squeeze(0).squeeze(0)
+        print(f"Successfully decoded audio with shape: {audio.shape}")
     except Exception as e:
         print(f"Error during audio decode: {e}")
         raise e
