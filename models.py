@@ -231,148 +231,80 @@ class Model(nn.Module):
         debug: bool = False,
     ) -> torch.Tensor:
         """
-        Args:
-            tokens: (batch_size, seq_len, audio_num_codebooks+1)
-            tokens_mask: (batch_size, seq_len, audio_num_codebooks+1)
-            input_pos: (batch_size, seq_len) positions for each token
-            mask: (batch_size, seq_len, max_seq_len
-            debug: Whether to print debug information about devices
-
-        Returns:
-            (batch_size, audio_num_codebooks) sampled tokens
+        Generate audio tokens with proper sequence handling
         """
-        # Get device from parameters to ensure consistency
-        param_device = next(self.parameters()).device
+        # Get device from parameters
+        device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
         b, s, _ = tokens.size()
 
-        # Ensure caches are set up - create if missing
+        # Ensure inputs on correct device
+        tokens = tokens.to(device)
+        tokens_mask = tokens_mask.to(device)
+        input_pos = input_pos.to(device)
+        
+        # Ensure caches are set up
         if not hasattr(self, "backbone_causal_mask"):
-            if debug:
-                print("Setting up caches before generation...")
             self.setup_caches(b)
-
-        # Debug device info (only if debug=True)
-        if debug:
-            print(f"Parameter device: {param_device}, Input device: {tokens.device}")
         
-        # Ignore device mismatch when it's just "cuda" vs "cuda:0" etc.
-        # as long as they're both on the same type of device (cuda or cpu)
-        inputs_on_correct_type = (
-            str(tokens.device).split(':')[0] == str(param_device).split(':')[0] and
-            str(tokens_mask.device).split(':')[0] == str(param_device).split(':')[0] and
-            str(input_pos.device).split(':')[0] == str(param_device).split(':')[0]
-        )
-        
-        # Force all inputs to the parameter device for consistency only if truly needed
-        device = param_device
-        if not inputs_on_correct_type:
-            tokens = tokens.to(device, non_blocking=False)
-            tokens_mask = tokens_mask.to(device, non_blocking=False)
-            input_pos = input_pos.to(device, non_blocking=False)
-            if debug:
-                print(f"Moved inputs to {device}")
-        
-        # Force synchronization to ensure device transfers are complete
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-
-        # Get the backbone mask, ensuring it exists and is on the right device
-        if not hasattr(self, "backbone_causal_mask"):
-            # If still missing despite trying to set up, create a fallback mask
-            print("Creating fallback causal mask")
-            backbone_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
-            self.register_buffer("backbone_causal_mask", backbone_mask, persistent=True)
-        
-        # Ensure backbone_causal_mask is on the right device    
-        self.backbone_causal_mask = self.backbone_causal_mask.to(device, non_blocking=False)
+        # Get the backbone mask and ensure it's on the right device    
+        self.backbone_causal_mask = self.backbone_causal_mask.to(device)
         
         # Create the mask for this input
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
-        curr_backbone_mask = curr_backbone_mask.to(device, non_blocking=False)
-        
-        # Ensure backbone is on the right device
-        if hasattr(self.backbone, 'to'):
-            self.backbone = self.backbone.to(device)
         
         # Generate embeddings and forward pass
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
         
-        # Ensure all tensors are on the same device before calling backbone
-        h = h.to(device, non_blocking=False)
-        input_pos = input_pos.to(device, non_blocking=False)
-        curr_backbone_mask = curr_backbone_mask.to(device, non_blocking=False)
-        
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            
-        # Call backbone with explicit device control
+        # Process through backbone
         h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
-        h = h.to(device=device, dtype=dtype, non_blocking=False)
-        
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        h = h.to(device=device, dtype=dtype)
 
+        # First codebook
         last_h = h[:, -1, :].to(device)
         c0_logits = self.codebook0_head(last_h)
         c0_sample = sample_topk(c0_logits, topk, temperature).to(device)
         c0_embed = self._embed_audio(0, c0_sample)
 
+        # Initialize sequence for remaining codebooks
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1).to(device)
         curr_sample = c0_sample.clone().to(device)
         
-        # Create fixed positions for the decoder with explicit device
-        batch_size = curr_h.size(0)
-        curr_pos = torch.zeros((batch_size, 2), dtype=torch.long, device=device)
-        curr_pos[:, 1] = 1  # Set second position to 1
-
-        # No need to reset decoder caches when using our fixed attention
+        # Create position ids for the decoder that properly track sequence position
+        seq_pos = torch.arange(2, device=device).unsqueeze(0).expand(b, -1)
+        
+        # Process remaining codebooks with proper sequence handling
         for i in range(1, self.args.audio_num_codebooks):
-            # Create a fresh 2x2 causal mask for each iteration with explicit device
-            curr_decoder_mask = torch.tril(
-                torch.ones(2, 2, dtype=torch.bool, device=device)
-            ).unsqueeze(0).expand(curr_h.size(0), 2, 2)
-            
-            # Ensure projection output has exactly 2 sequence positions
+            # Project through decoder and maintain sequence information
             projection_out = self.projection(curr_h).to(device)
-            if projection_out.size(1) != 2:
-                # Force to exactly 2 positions
-                if projection_out.size(1) > 2:
-                    # Take first 2 positions
-                    projection_out = projection_out[:, :2]
-                else:
-                    # Repeat last position to get 2 positions
-                    pad = projection_out[:, -1:].expand(-1, 2-projection_out.size(1), -1)
-                    projection_out = torch.cat([projection_out, pad], dim=1)
             
-            # Ensure everything is on the same device
-            projection_out = projection_out.to(device)
+            # Create causal mask for the decoder
+            curr_decoder_mask = torch.tril(
+                torch.ones(projection_out.size(1), projection_out.size(1), dtype=torch.bool, device=device)
+            ).unsqueeze(0).expand(b, -1, -1)
             
-            # Use our fixed decoder with explicit device handling
+            # Process through decoder with proper position tracking
             decoder_h = self.decoder(
-                projection_out, 
-                input_pos=curr_pos, 
+                projection_out,
+                input_pos=seq_pos,
                 mask=curr_decoder_mask
             ).to(device=device, dtype=dtype)
             
-            # Ensure audio_head is on same device before matmul
+            # Generate next codebook token
             audio_head_i = self.audio_head[i - 1].to(device)
             ci_logits = torch.matmul(decoder_h[:, -1, :], audio_head_i)
             ci_sample = sample_topk(ci_logits, topk, temperature).to(device)
             ci_embed = self._embed_audio(i, ci_sample)
 
-            curr_h = ci_embed.to(device)
+            # Update sequence with new token
+            curr_h = torch.cat([curr_h, ci_embed], dim=1).to(device)
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1).to(device)
-            curr_pos = torch.zeros((curr_h.size(0), 2), dtype=torch.long, device=device) 
-            curr_pos[:, 1] = 1
             
-        # Final device check 
-        curr_sample = curr_sample.to(device)
-        # Only print debug info if requested
-        if debug:
-            print(f"Generated frame output device: {curr_sample.device}")
+            # Update position IDs to track growing sequence
+            seq_pos = torch.arange(curr_h.size(1), device=device).unsqueeze(0).expand(b, -1)
+        
         return curr_sample
 
     def reset_caches(self):

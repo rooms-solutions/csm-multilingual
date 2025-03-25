@@ -56,8 +56,8 @@ class Generator:
     mimi = loaders.get_mimi(mimi_weight, device=self.device)
     mimi.set_num_codebooks(32)
 
-    # Wrap the mimi codec in our safe wrapper
-    self._audio_tokenizer = create_safe_mimi_wrapper(mimi, device=self.device)
+    # Wrap the mimi codec in our robust wrapper
+    self._audio_tokenizer = create_mimi_codec_wrapper(mimi, device=self.device)
 
     # Store maximum token value for safety checks during decoding
     if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
@@ -207,34 +207,19 @@ class Generator:
     audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
     print(f"Audio token shape after permute: {audio_tokens.shape}")
 
-    # Modern CSM ordering is [batch, codebooks, seq_len], which is what we have here
-    # Correct shape is now [1, 32, sequence_length]
-    if audio_tokens.shape[1] != 32:  # Check codebooks are in dimension 1
-        raise ValueError(f"Expected 32 codebooks in dimension 1 but got {audio_tokens.shape[1]}. The model architecture is incompatible.")
+    # Correctly format tokens for Mimi decoder
+    audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
+    print(f"Audio token shape after permute: {audio_tokens.shape}")
 
-    # Convert to exactly 64 channels as expected by Mimi
-    # Do a direct reshape that preserves all information from original tokens
-    # This is the critical fix - proper handling of the channel dimension
-    try:
-        if audio_tokens.shape[1] == 32:
-            # Audio tokens already in format [batch=1, codebooks=32, seq_len]
-            print(f"Final audio token shape before decode: {audio_tokens.shape}")
-            
-            # Apply special German model adapter if needed
-            # This handles the 512 → 64 channel conversion
-            if audio_tokens.shape[1] == 512 or audio_tokens.shape[1] == 32:
-                audio_tokens = reshape_tokens_for_german_model(audio_tokens)
-            
-            # Decode directly without patching or fallbacks
-            try:
-                audio = self._audio_tokenizer.decode(audio_tokens)
-                audio = audio.squeeze(0).squeeze(0)
-                print(f"Successfully decoded audio with shape: {audio.shape}")
-            except Exception as e:
-                # Provide clear error without fallbacks
-                raise RuntimeError(f"Audio decoding failed with error: {e}. The model may need retraining with a compatible architecture.") from e
-        else:
-            raise ValueError(f"Unexpected token dimensions: {audio_tokens.shape}. Cannot produce clear audio with this format.")
+    # Ensure we have exactly 32 codebooks as expected by Mimi
+    if audio_tokens.shape[1] != 32:
+        audio_tokens = reshape_tokens_for_german_model(audio_tokens)
+        print(f"Reshaped to {audio_tokens.shape} for Mimi compatibility")
+
+    # Decode directly without patching
+    audio = self._audio_tokenizer.decode(audio_tokens)
+    audio = audio.squeeze(0).squeeze(0)
+    print(f"Successfully decoded audio with shape: {audio.shape}")
     except Exception as e:
         print(f"Error during audio decode: {e}")
         raise e
@@ -274,35 +259,30 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
 
 def reshape_tokens_for_german_model(audio_tokens):
     """
-    Special adapter function for the German model that converts 512 channels to 64
-    while preserving audio structure
+    Properly convert model tokens to format expected by Mimi codec
+    without losing critical information
     """
-    # Get shape information
     batch_size, channels, seq_len = audio_tokens.shape
     
-    if channels == 512 and seq_len > 0:
-        print(f"Applying German model token adapter: {channels} → 64 channels")
+    # Check if we actually need to reshape
+    if channels == 32:
+        return audio_tokens  # Already in the correct format
         
-        # Reshape to isolate each codebook component
-        # [B, 512, S] → [B, 64, 8, S] where 512 = 64 × 8
-        reshaped = audio_tokens.reshape(batch_size, 64, 8, seq_len)
+    if channels != 32:
+        print(f"WARNING: Model outputs {channels} channels but Mimi expects 32")
         
-        # Take weighted average of each group to maintain audio structure
-        # Create importance weights that prioritize certain dimensions
-        weights = torch.tensor([0.2, 0.3, 0.5, 0.7, 0.9, 0.7, 0.5, 0.3], 
-                              device=audio_tokens.device).view(1, 1, 8, 1)
-        
-        # Apply weighted average
-        weighted = reshaped * weights
-        adapted_tokens = weighted.sum(dim=2) / weights.sum()
-        
-        # Ensure we have the right datatype
-        adapted_tokens = adapted_tokens.to(dtype=audio_tokens.dtype)
-        print(f"Successfully adapted tokens from shape {audio_tokens.shape} to {adapted_tokens.shape}")
-        
-        return adapted_tokens
-    
-    # Return original if no adaptation needed
+        # Don't use weighted averaging - it loses critical information
+        # Instead, slice the first 32 codebooks which contain most of the
+        # acoustic information
+        if channels > 32:
+            return audio_tokens[:, :32, :]
+        else:
+            # Pad to 32 channels if we have fewer
+            padding = torch.zeros(batch_size, 32-channels, seq_len, 
+                               device=audio_tokens.device,
+                               dtype=audio_tokens.dtype)
+            return torch.cat([audio_tokens, padding], dim=1)
+            
     return audio_tokens
 
 def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
@@ -340,23 +320,67 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
   return generator
 
 
-def create_safe_mimi_wrapper(original_mimi, device="cuda"):
-    """Create a minimal wrapper for Mimi codec that follows CSM approach"""
+def create_mimi_codec_wrapper(original_mimi, device="cuda"):
+    """Create proper wrapper for Mimi codec that preserves all functionality"""
     
-    class SimpleCSMCompatibleMimi:
+    class RobustMimiWrapper:
         def __init__(self, mimi, device):
             self.mimi = mimi
             self.device = device
+            self.sample_rate = getattr(mimi, 'sample_rate', 24000)
+            
+            # Store codebook information
+            self.num_codebooks = getattr(mimi, 'num_codebooks', 32)
+            self.codebook_size = 2048  # Default for Mimi
+            
+            if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
+                self.codebook_size = mimi.vq.codebook_size
+                
+            print(f"Initialized Mimi wrapper: {self.num_codebooks} codebooks, size {self.codebook_size}")
             
         def parameters(self):
             return self.mimi.parameters()
             
         def encode(self, audio):
-            return self.mimi.encode(audio)
+            """Encode audio to tokens with proper error handling"""
+            try:
+                # Ensure audio is on the correct device
+                audio = audio.to(self.device)
+                tokens = self.mimi.encode(audio)
+                
+                # Verify token range
+                if isinstance(tokens, tuple):
+                    tokens = tokens[0]  # Some Mimi versions return a tuple
+                    
+                # Ensure tokens are valid
+                if torch.max(tokens) >= self.codebook_size:
+                    print(f"WARNING: Tokens exceed codebook size {self.codebook_size}")
+                    tokens = torch.clamp(tokens, 0, self.codebook_size-1)
+                    
+                return tokens
+            except Exception as e:
+                print(f"Error encoding audio: {e}")
+                raise
             
         def decode(self, tokens):
-            # Direct decoding without any fallbacks or fixes
-            # Tokens should be in format [batch, codebooks, seq_len]
-            return self.mimi.decode(tokens)
+            """Decode tokens to audio with proper error handling"""
+            try:
+                # Ensure tokens are on the correct device
+                tokens = tokens.to(self.device)
+                
+                # Verify token shape - Mimi expects [batch, codebooks, seq_len]
+                if tokens.shape[1] != self.num_codebooks:
+                    raise ValueError(f"Mimi expects {self.num_codebooks} codebooks but got {tokens.shape[1]}")
+                
+                # Ensure tokens are valid
+                if torch.max(tokens) >= self.codebook_size:
+                    print(f"WARNING: Tokens exceed codebook size {self.codebook_size}")
+                    tokens = torch.clamp(tokens, 0, self.codebook_size-1)
+                
+                # Decode with the actual Mimi codec
+                return self.mimi.decode(tokens)
+            except Exception as e:
+                print(f"Error decoding tokens: {e}")
+                raise
         
-    return SimpleCSMCompatibleMimi(original_mimi, device)
+    return RobustMimiWrapper(original_mimi, device)

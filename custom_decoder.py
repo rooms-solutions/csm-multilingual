@@ -61,6 +61,163 @@ class FixedPositionRoPE(nn.Module):
         return torch.cat([out_real, out_imag], dim=-1)
 
 
+class EnhancedDecoderAttention(nn.Module):
+    """Proper decoder attention that matches original CSM architecture"""
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        # Standard attention projections
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        
+        # Standard rotary embeddings with proper sequence length support
+        self.max_seq_len = 2048
+        self.pos_embed = self._create_proper_rope()
+        
+        # KV caching for efficient generation
+        self.k_cache = None
+        self.v_cache = None
+        self.cache_size = 0
+        self.cache_enabled = True
+        
+    def _create_proper_rope(self):
+        """Create proper rotary positional embeddings"""
+        from torch import nn
+        import math
+        
+        class ProperRotaryEmbedding(nn.Module):
+            def __init__(self, dim, max_pos=2048, base=10000.0):
+                super().__init__()
+                self.dim = dim
+                self.max_pos = max_pos
+                self.base = base
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+                self.register_buffer("inv_freq", inv_freq)
+                
+            def forward(self, x, position_ids):
+                """Apply RoPE to tensor x based on position_ids"""
+                batch, seq_len, heads, dim = x.shape
+                half_dim = dim // 2
+                
+                # Get embeddings for positions
+                inv_freq = self.inv_freq
+                positions = position_ids.float()
+                
+                # Compute sin and cos for positions
+                freqs = torch.einsum('bi,j->bij', positions, inv_freq)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos().unsqueeze(2)
+                sin = emb.sin().unsqueeze(2)
+                
+                # Apply rotation
+                x_real, x_imag = x[..., :half_dim], x[..., half_dim:]
+                out_real = x_real * cos - x_imag * sin
+                out_imag = x_imag * cos + x_real * sin
+                
+                return torch.cat([out_real, out_imag], dim=-1)
+                
+        return ProperRotaryEmbedding(self.head_dim)
+        
+    def _setup_cache(self, batch_size, seq_len, device):
+        """Set up KV cache for efficient generation"""
+        if not self.cache_enabled:
+            return
+            
+        self.k_cache = torch.zeros(
+            (batch_size, seq_len, self.num_heads, self.head_dim),
+            device=device, dtype=self.q_proj.weight.dtype
+        )
+        self.v_cache = torch.zeros(
+            (batch_size, seq_len, self.num_heads, self.head_dim),
+            device=device, dtype=self.q_proj.weight.dtype
+        )
+        self.cache_size = 0
+    
+    def forward(self, x, mask=None, position_ids=None, input_pos=None):
+        """Forward pass supporting both training and generation modes"""
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+        
+        # Set up position IDs if not provided
+        if position_ids is None:
+            if input_pos is not None:
+                position_ids = input_pos
+            else:
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Project queries, keys, values
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        
+        # Apply rotary position embeddings properly
+        q = self.pos_embed(q, position_ids)
+        k = self.pos_embed(k, position_ids)
+        
+        # Handle KV caching for generation
+        if self.cache_enabled and hasattr(self, 'k_cache') and self.k_cache is not None:
+            if self.k_cache.size(0) != batch_size:
+                self._setup_cache(batch_size, self.max_seq_len, device)
+                
+            if seq_len == 1 and self.cache_size > 0:  # Autoregressive generation
+                # Update cache with new KV
+                self.k_cache[:, self.cache_size:self.cache_size+1] = k
+                self.v_cache[:, self.cache_size:self.cache_size+1] = v
+                
+                # Use full cached context
+                k_full = self.k_cache[:, :self.cache_size+1]
+                v_full = self.v_cache[:, :self.cache_size+1]
+                
+                # Update cache size
+                self.cache_size += 1
+                
+                # Reshape for attention
+                k = k_full
+                v = v_full
+            else:  # Full sequence processing or cache reset
+                self.k_cache[:, :seq_len] = k
+                self.v_cache[:, :seq_len] = v
+                self.cache_size = seq_len
+        
+        # Reshape for attention
+        q = q.transpose(1, 2)  # [batch, heads, seq, dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Handle various mask formats
+            if mask.dim() == 2:  # [seq, seq]
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:  # [batch, seq, seq]
+                mask = mask.unsqueeze(1)
+                
+            attn_weights = attn_weights.masked_fill(~mask, float('-inf'))
+        
+        # Get attention probabilities
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        # Apply attention
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        return self.out_proj(attn_output)
+        
+    def caches_are_enabled(self):
+        return self.cache_enabled
+        
+    def reset_caches(self):
+        self.cache_size = 0
+
 class SimpleDecoderAttention(nn.Module):
     """Simplified decoder attention that doesn't rely on caching"""
     def __init__(self, embed_dim, num_heads):
@@ -204,7 +361,7 @@ class SimpleDecoderAttention(nn.Module):
 
 
 def fix_decoder_attention(model):
-    """Replace problematic attention modules with our fixed implementation"""
+    """Replace problematic attention modules with our improved implementation"""
     if hasattr(model.decoder, 'layers'):
         # Get device from model
         device = next(model.parameters()).device
@@ -216,8 +373,8 @@ def fix_decoder_attention(model):
                 embed_dim = layer.attn.q_proj.out_features if hasattr(layer.attn, 'q_proj') else 1024
                 num_heads = layer.attn.num_heads if hasattr(layer.attn, 'num_heads') else 8
                 
-                # Replace with our custom implementation and ensure it's on the same device
-                new_attn = SimpleDecoderAttention(embed_dim, num_heads)
+                # Replace with our enhanced implementation
+                new_attn = EnhancedDecoderAttention(embed_dim, num_heads)
                 new_attn = new_attn.to(device=device, dtype=dtype)
                 
                 # Force synchronization to ensure module is on the correct device
@@ -226,6 +383,6 @@ def fix_decoder_attention(model):
                 
                 # Replace the attention module
                 layer.attn = new_attn
-                print(f"Replaced attention in decoder layer {i} - device: {new_attn._device_tracker.device}")
+                print(f"Replaced decoder layer {i} with EnhancedDecoderAttention")
     
     return model
