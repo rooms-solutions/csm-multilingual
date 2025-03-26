@@ -231,7 +231,7 @@ class Model(nn.Module):
         debug: bool = False,
     ) -> torch.Tensor:
         """
-        Generate audio tokens with proper sequence handling
+        Generate audio tokens using the same logic as in training (original CSM approach)
         """
         # Get device from parameters
         device = next(self.parameters()).device
@@ -259,51 +259,37 @@ class Model(nn.Module):
         h = masked_embeds.sum(dim=2)
         
         # Process through backbone
-        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
-        h = h.to(device=device, dtype=dtype)
+        backbone_output = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
+        backbone_output = backbone_output.to(device=device, dtype=dtype)
 
-        # First codebook
-        last_h = h[:, -1, :].to(device)
+        # First codebook - directly from backbone
+        last_h = backbone_output[:, -1, :].to(device)
         c0_logits = self.codebook0_head(last_h)
         c0_sample = sample_topk(c0_logits, topk, temperature).to(device)
         c0_embed = self._embed_audio(0, c0_sample)
 
         # Initialize sequence for remaining codebooks
-        curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1).to(device)
         curr_sample = c0_sample.clone().to(device)
         
-        # Create position ids for the decoder that properly track sequence position
-        seq_pos = torch.arange(2, device=device).unsqueeze(0).expand(b, -1)
-        
-        # Process remaining codebooks with proper sequence handling
+        # Process remaining codebooks using EXACTLY the same approach as in training
+        # Without using the decoder at all
         for i in range(1, self.args.audio_num_codebooks):
-            # Project through decoder and maintain sequence information
-            projection_out = self.projection(curr_h).to(device)
+            # WICHTIG: Wir verwenden backbone_output direkt wie beim Training
+            # Projektion anwenden genau wie im Training
+            projection_output = self.projection(backbone_output[:, -1, :].unsqueeze(1)).squeeze(1)
+            projection_output = projection_output.to(device=device, dtype=dtype)
             
-            # Create causal mask for the decoder
-            curr_decoder_mask = torch.tril(
-                torch.ones(projection_out.size(1), projection_out.size(1), dtype=torch.bool, device=device)
-            ).unsqueeze(0).expand(b, -1, -1)
+            # Audio-Head für diese Codebook
+            audio_head_i = self.audio_head[i - 1].to(device=device, dtype=dtype)
             
-            # Process through decoder with proper position tracking
-            decoder_h = self.decoder(
-                projection_out,
-                input_pos=seq_pos,
-                mask=curr_decoder_mask
-            ).to(device=device, dtype=dtype)
+            # Direkte Matrixmultiplikation wie im Training
+            ci_logits = torch.matmul(projection_output, audio_head_i)
             
-            # Generate next codebook token
-            audio_head_i = self.audio_head[i - 1].to(device)
-            ci_logits = torch.matmul(decoder_h[:, -1, :], audio_head_i)
+            # Sampling und Embedding
             ci_sample = sample_topk(ci_logits, topk, temperature).to(device)
-            ci_embed = self._embed_audio(i, ci_sample)
-
-            # Update sequence with new token
-            curr_h = torch.cat([curr_h, ci_embed], dim=1).to(device)
-            curr_sample = torch.cat([curr_sample, ci_sample], dim=1).to(device)
             
-            # Update position IDs to track growing sequence
-            seq_pos = torch.arange(curr_h.size(1), device=device).unsqueeze(0).expand(b, -1)
+            # Füge das neue Sample zur Sequenz hinzu
+            curr_sample = torch.cat([curr_sample, ci_sample], dim=1).to(device)
         
         return curr_sample
 
