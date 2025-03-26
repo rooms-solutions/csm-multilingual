@@ -138,10 +138,21 @@ class EnhancedDecoderAttention(nn.Module):
         )
         self.cache_size = 0
     
-    def forward(self, x, mask=None, position_ids=None, input_pos=None):
-        """Forward pass supporting both training and generation modes"""
+    def forward(self, x, *args, **kwargs):
+        """Forward pass supporting both training and generation modes with flexible arg handling"""
         batch_size, seq_len, _ = x.shape
         device = x.device
+        
+        # Extract parameters with precedence to named arguments
+        mask = kwargs.get('mask', None)
+        position_ids = kwargs.get('position_ids', None)
+        input_pos = kwargs.get('input_pos', None)
+        
+        # Backward compatibility for positional args
+        if len(args) >= 1 and mask is None:
+            mask = args[0]
+        if len(args) >= 2 and position_ids is None:
+            position_ids = args[1]
         
         # Set up position IDs if not provided
         if position_ids is None:
