@@ -268,8 +268,8 @@ class Model(nn.Module):
         c0_sample = sample_topk(c0_logits, topk, temperature).to(device)
         c0_embed = self._embed_audio(0, c0_sample)
 
-        # Initialize sequence for remaining codebooks
-        curr_sample = c0_sample.clone().to(device)
+        # Collect codebook samples in a list instead of concatenating
+        all_samples = [c0_sample]
         
         # Process remaining codebooks using EXACTLY the same approach as in training
         # Without using the decoder at all
@@ -288,10 +288,14 @@ class Model(nn.Module):
             # Sampling und Embedding
             ci_sample = sample_topk(ci_logits, topk, temperature).to(device)
             
-            # Füge das neue Sample zur Sequenz hinzu
-            curr_sample = torch.cat([curr_sample, ci_sample], dim=1).to(device)
+            # Add debug information
+            print(f"Codebook {i} sample shape: {ci_sample.shape}, values: {ci_sample[0].tolist()}")
+            
+            # Add the sample to our list
+            all_samples.append(ci_sample)
         
-        return curr_sample
+        # Stack in the codebook dimension (dimension 1)
+        return torch.cat(all_samples, dim=1).to(device)
 
     def reset_caches(self):
         """Reset caches for backbone only.

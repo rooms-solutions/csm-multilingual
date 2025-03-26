@@ -337,7 +337,10 @@ class SimpleDecoderAttention(nn.Module):
         q = q.transpose(1, 2)  # [batch, heads, seq, dim]
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
+    
+        # Ensure all tensors are on the same device (debug print)
+        print(f"Attention tensors - q: {q.device}, k: {k.device}, v: {v.device}")
+    
         # Compute attention scores
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         

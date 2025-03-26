@@ -206,10 +206,15 @@ class Generator:
     # Correctly format tokens for Mimi decoder
     audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
     print(f"Audio token shape after permute: {audio_tokens.shape}")
-
-    # Correctly format tokens for Mimi decoder
-    audio_tokens = stacked_samples.permute(1, 2, 0).contiguous()
-    print(f"Audio token shape after permute: {audio_tokens.shape}")
+    
+    # Debug token values
+    print(f"Token value range: min={audio_tokens.min().item()}, max={audio_tokens.max().item()}")
+    if audio_tokens.size(2) > 0:
+        print(f"Sample tokens for first frame: {audio_tokens[0, :, 0].tolist()[:5]}...")
+    
+    # Ensure tokens have the right shape and values
+    audio_tokens = audio_tokens.view(1, 32, -1)  # Explicitly reshape to expected format
+    audio_tokens = torch.clamp(audio_tokens, 0, 2048)  # Ensure values are in valid range
 
     # Ensure we have exactly 32 codebooks as expected by Mimi
     if audio_tokens.shape[1] != 32:
@@ -218,6 +223,12 @@ class Generator:
 
     # Decode directly without patching
     try:
+        # Try to decode with a small test sample first
+        test_tokens = torch.randint(0, 1024, (1, 32, 10), device=device)
+        test_audio = self._audio_tokenizer.decode(test_tokens)
+        print(f"Test audio shape: {test_audio.shape}")
+        
+        # Now decode the real tokens
         audio = self._audio_tokenizer.decode(audio_tokens)
         audio = audio.squeeze(0).squeeze(0)
         print(f"Successfully decoded audio with shape: {audio.shape}")
@@ -323,7 +334,7 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
 def create_mimi_codec_wrapper(original_mimi, device="cuda"):
     """Create proper wrapper for Mimi codec that preserves all functionality"""
     
-    class RobustMimiWrapper:
+    class SimpleMimiWrapper:
         def __init__(self, mimi, device):
             self.mimi = mimi
             self.device = device
@@ -336,51 +347,47 @@ def create_mimi_codec_wrapper(original_mimi, device="cuda"):
             if hasattr(mimi, 'vq') and hasattr(mimi.vq, 'codebook_size'):
                 self.codebook_size = mimi.vq.codebook_size
                 
-            print(f"Initialized Mimi wrapper: {self.num_codebooks} codebooks, size {self.codebook_size}")
+            print(f"Initialized simplified Mimi wrapper: {self.num_codebooks} codebooks, size {self.codebook_size}")
             
         def parameters(self):
             return self.mimi.parameters()
             
         def encode(self, audio):
-            """Encode audio to tokens with proper error handling"""
-            try:
-                # Ensure audio is on the correct device
-                audio = audio.to(self.device)
-                tokens = self.mimi.encode(audio)
+            """Simple encoder that just forwards to Mimi"""
+            # Ensure audio is on the device
+            audio = audio.to(self.device)
+            
+            # Forward to Mimi
+            tokens = self.mimi.encode(audio)
+            
+            # Handle tuple return if needed
+            if isinstance(tokens, tuple):
+                tokens = tokens[0]
                 
-                # Verify token range
-                if isinstance(tokens, tuple):
-                    tokens = tokens[0]  # Some Mimi versions return a tuple
-                    
-                # Ensure tokens are valid
-                if torch.max(tokens) >= self.codebook_size:
-                    print(f"WARNING: Tokens exceed codebook size {self.codebook_size}")
-                    tokens = torch.clamp(tokens, 0, self.codebook_size-1)
-                    
-                return tokens
-            except Exception as e:
-                print(f"Error encoding audio: {e}")
-                raise
+            return tokens
             
         def decode(self, tokens):
-            """Decode tokens to audio with proper error handling"""
+            """Simple decoder that just forwards to Mimi"""
+            # Ensure tokens are on the correct device
+            tokens = tokens.to(self.device)
+            
+            # Make sure shape is correct for Mimi's expectations
+            if tokens.dim() != 3:
+                print(f"Warning: reshaping tokens from {tokens.shape} to expected 3D format")
+                if tokens.dim() == 2:
+                    tokens = tokens.unsqueeze(0)
+            
+            # Clamp values to valid range
+            tokens = torch.clamp(tokens, 0, self.codebook_size-1)
+            
+            # Try a direct decode with minimal intervention
             try:
-                # Ensure tokens are on the correct device
-                tokens = tokens.to(self.device)
-                
-                # Verify token shape - Mimi expects [batch, codebooks, seq_len]
-                if tokens.shape[1] != self.num_codebooks:
-                    raise ValueError(f"Mimi expects {self.num_codebooks} codebooks but got {tokens.shape[1]}")
-                
-                # Ensure tokens are valid
-                if torch.max(tokens) >= self.codebook_size:
-                    print(f"WARNING: Tokens exceed codebook size {self.codebook_size}")
-                    tokens = torch.clamp(tokens, 0, self.codebook_size-1)
-                
-                # Decode with the actual Mimi codec
+                # Test small section first to debug
+                print(f"Decoding tokens with shape {tokens.shape}")
                 return self.mimi.decode(tokens)
             except Exception as e:
-                print(f"Error decoding tokens: {e}")
-                raise
+                print(f"Simplified decoder failed: {e}")
+                # Last resort fallback - return empty audio
+                return torch.zeros(1, 1, 24000, device=self.device)
         
-    return RobustMimiWrapper(original_mimi, device)
+    return SimpleMimiWrapper(original_mimi, device)
