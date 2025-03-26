@@ -44,12 +44,11 @@ def load_multilingual_model(language_code: str, checkpoint_path: str = None, dev
         if checkpoint_path is None:
             raise FileNotFoundError(f"No checkpoint found for language '{language_code}'. Please specify a checkpoint path.")
     
-    # Load model with our custom loader that handles the SimpleDecoderAttention architecture
+    # Load model with our standard CSM architecture loader
     print(f"Loading model from {checkpoint_path}...")
-    # Replace the load_csm_1b call with our custom loader
-    from generator import load_multilingual_model as load_model_with_custom_decoder
-    generator = load_model_with_custom_decoder(checkpoint_path, device=device)
-    print("Model loaded successfully.")
+    # Use our multilingual model loader without custom decoder modification
+    from generator import load_multilingual_model
+    generator = load_multilingual_model(checkpoint_path, device=device)
     
     return generator
 

@@ -287,7 +287,7 @@ def reshape_tokens_for_german_model(audio_tokens):
     return audio_tokens
 
 def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
-  """Load a multilingual model with compatibility for custom decoder attention"""
+  """Load a multilingual model using standard CSM architecture"""
   # Ensure device is a torch.device object
   if isinstance(device, str):
     device = torch.device(device)
@@ -303,16 +303,12 @@ def load_multilingual_model(ckpt_path: str, device: str = "cuda") -> Generator:
   # Create model with correct dtype from the start
   model = Model(model_args).to(device=device, dtype=torch.bfloat16)
 
-  # Apply the same custom decoder fix used during training
-  from custom_decoder import fix_decoder_attention
-  model = fix_decoder_attention(model)
-
   # Load state dict with some forgiveness for mismatched keys
   state_dict = torch.load(ckpt_path, map_location=device)
 
   # Try loading with strict=False to ignore missing/unexpected keys
   model.load_state_dict(state_dict, strict=False)
-  print("Model loaded with adjusted decoder attention architecture")
+  print("Model loaded successfully")
 
   # Make sure everything is on the correct device
   model = model.to(device)
